@@ -13,6 +13,7 @@ and no reseal per consent.
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import sys
 from datetime import UTC, datetime, timedelta
@@ -102,6 +103,9 @@ def run_consent(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Everything this process writes to the state dir is personal financial data.
+    # Flow runs started by serve() inherit the umask.
+    os.umask(0o077)
     if args.command in (None, "serve"):
         flow.import_flow.serve(name="transaction-import")
         return 0

@@ -60,10 +60,12 @@ def state(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("argv", [[], ["serve"]])
 def test_serve_is_the_default(monkeypatch, argv):
-    served = []
+    served, umasks = [], []
     monkeypatch.setattr(flow.import_flow, "serve", lambda **kw: served.append(kw))
+    monkeypatch.setattr(cli.os, "umask", umasks.append)
     assert cli.main(argv) == 0
     assert served == [{"name": "transaction-import"}]
+    assert umasks == [0o077]
 
 
 def test_consent_requires_the_bank_and_redirect():

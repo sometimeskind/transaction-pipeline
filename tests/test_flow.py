@@ -61,6 +61,17 @@ def test_fetch_has_no_retries_and_store_retries():
     assert flow.store_pages.retries == flow.STORE_RETRIES > 0
 
 
+def test_nothing_is_persisted_to_prefect_result_storage():
+    assert flow.fetch_pages.persist_result is False
+    assert flow.store_pages.persist_result is False
+    assert import_flow.persist_result is False
+
+
+def test_tasks_take_no_session_or_transaction_data():
+    assert set(flow.fetch_pages.fn.__annotations__) - {"return"} == {"run_dir", "date_from", "date_to"}
+    assert set(flow.store_pages.fn.__annotations__) - {"return"} == {"pages"}
+
+
 def test_state_dir_comes_from_the_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("STATE_DIR", str(tmp_path))
     assert flow.session_path() == tmp_path / "session.json"
@@ -95,6 +106,8 @@ def test_every_page_is_saved_per_account(tmp_path):
         UID_B: [tmp_path / UID_B / "page-1.json"],
     }
     assert json.loads(pages[UID_A][1].read_text()) == {"transactions": [tx("a2")]}
+    assert os.stat(pages[UID_A][0]).st_mode & 0o777 == 0o600
+    assert os.stat(tmp_path / UID_A).st_mode & 0o777 == 0o700
     assert bank.calls == [(UID_A, FROM, TO), (UID_B, FROM, TO)]
 
 

@@ -9,6 +9,11 @@ Prefect schedules and runs it, and is never the source of truth (homelab#1981):
   the store step can retry without touching the bank.
 - Idempotency lives in Firefly (entry_reference → external_id). The window
   overlaps the previous runs on purpose: a failed run is covered by the next one.
+
+Everything under STATE_DIR is personal financial data (the session reads every
+consented account; raw pages carry IBANs, counterparties and amounts). So files
+are owner-only, and none of it passes through Prefect: tasks take and return
+paths and dates only, and no result is persisted to Prefect's result storage.
 """
 
 from __future__ import annotations
@@ -61,11 +66,12 @@ def session_path() -> Path:
     return state_dir() / "session.json"
 
 
-def write_json(path: Path, data: object, *, mode: int = 0o644) -> Path:
-    """Write via a temp file and rename, so a crash never leaves half a file behind."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_json(path: Path, data: object) -> Path:
+    """Write owner-only via a temp file and rename, so a crash never leaves half a file behind."""
+    for directory in reversed([d for d in (path.parent, *path.parent.parents) if not d.exists()]):
+        directory.mkdir(mode=0o700, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
     tmp.replace(path)
@@ -73,8 +79,7 @@ def write_json(path: Path, data: object, *, mode: int = 0o644) -> Path:
 
 
 def write_session(path: Path, session: dict) -> None:
-    # The session ID plus the app key reads every consented account: owner-only.
-    write_json(path, session, mode=0o600)
+    write_json(path, session)
 
 
 def load_session(path: Path) -> dict:
@@ -180,8 +185,9 @@ def _retry_store(task, task_run, state) -> bool:
 
 
 # retries=0 is the default; spelled out because it's a constraint, not an oversight.
-@task(retries=0, cache_policy=NO_CACHE)
-def fetch_pages(session: dict, run_dir: Path, date_from: date, date_to: date) -> dict[str, list[Path]]:
+@task(retries=0, cache_policy=NO_CACHE, persist_result=False)
+def fetch_pages(run_dir: Path, date_from: date, date_to: date) -> dict[str, list[Path]]:
+    session = load_session(session_path())
     with enable_banking_client() as client:
         return save_pages(client, session, run_dir, date_from, date_to)
 
@@ -191,8 +197,10 @@ def fetch_pages(session: dict, run_dir: Path, date_from: date, date_to: date) ->
     retry_delay_seconds=STORE_RETRY_DELAY_SECONDS,
     retry_condition_fn=_retry_store,
     cache_policy=NO_CACHE,
+    persist_result=False,
 )
-def store_pages(session: dict, pages: dict[str, list[Path]]) -> StoreCounts:
+def store_pages(pages: dict[str, list[Path]]) -> StoreCounts:
+    session = load_session(session_path())
     with firefly_client() as client:
         counts = store_from_disk(client, session, pages)
     log.info("stored %d new, %d already in Firefly, %d skipped", counts.created, counts.existing, counts.skipped)
@@ -203,12 +211,12 @@ def run_id() -> str:
     return flow_run.id or "manual-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-@flow(name="transaction-import")
+@flow(name="transaction-import", persist_result=False)
 def import_flow(window_days: int = WINDOW_DAYS) -> None:
     """Fetch booked transactions from Enable Banking and write them to Firefly III."""
     session = load_session(session_path())
     metrics.push_consent_valid_until(consent_valid_until(session))
     today = datetime.now(UTC).date()
-    pages = fetch_pages(session, state_dir() / "raw" / run_id(), today - timedelta(days=window_days), today)
-    store_pages(session, pages)
+    pages = fetch_pages(state_dir() / "raw" / run_id(), today - timedelta(days=window_days), today)
+    store_pages(pages)
     metrics.push_success()
