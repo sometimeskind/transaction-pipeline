@@ -6,8 +6,9 @@ account information), maps them with logic tuned to our own accounts, and writes
 them through the Firefly III API. It replaces the Firefly III data importer.
 Intent and done-when: [homelab#1981](https://github.com/sometimeskind/homelab/issues/1981).
 
-**Status:** the flow and the consent command exist; the Firefly client and the mapping
-(`firefly.py`, `mapping.py`) are being written.
+**Status:** complete, not live yet. The consent command, the flow, the Firefly client and
+the mapping exist. Go-live (save-only runs, backfill, clean start, writes on) is
+tracked in homelab#1981.
 
 ## Consent
 

@@ -453,3 +453,18 @@ def test_replay_refuses_anything_but_a_run_id(state, monkeypatch, run):
     with pytest.raises(ValueError, match="not a run id"):
         harness.run(replay_run=run)
     assert harness.events == [CONSENT]
+
+
+def test_store_runs_through_the_real_mapping(tmp_path):
+    class NamedFirefly(FakeFirefly):
+        def accounts(self, account_type="asset"):
+            return [{"id": str(i), "attributes": {"iban": iban, "name": f"Synthetic {i}"}}
+                    for i, iban in enumerate((IBAN_A, IBAN_B, IBAN_C))]
+
+    fetched = flow.save_pages(FakeBank({UID_A: [{"transactions": [tx("a1")]}], **empty(UID_B, UID_C)}),
+                              SESSIONS, tmp_path, FROM, TO)
+    firefly = NamedFirefly()
+    rules = mapping.load_rules(tmp_path / "no-such-mapping.toml")
+    assert flow.store_from_disk(firefly, SESSIONS, fetched.pages, rules) == flow.StoreCounts(created=1)
+    [split] = firefly.stored[0]["transactions"]
+    assert (split["external_id"], split["type"], split["source_id"]) == ("a1", "withdrawal", "0")
