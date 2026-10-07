@@ -6,8 +6,74 @@ account information), maps them with logic tuned to our own accounts, and writes
 them through the Firefly III API. It replaces the Firefly III data importer.
 Intent and done-when: [homelab#1981](https://github.com/sometimeskind/homelab/issues/1981).
 
-**Status:** skeleton. The Enable Banking client (`enable_banking.py`), the Firefly
-client (`firefly.py`) and the mapping (`mapping.py`) exist; the flow does nothing yet.
+**Status:** complete, not live yet. The consent command, the flow, the Firefly client and
+the mapping exist. Go-live (save-only runs, backfill, clean start, writes on) is
+tracked in homelab#1981.
+
+## Consent
+
+Consent is given by hand in the running pod, once per bank login, when it is new or
+has expired:
+
+```
+python -m transaction_pipeline consent LABEL --aspsp-name NAME --country CC --redirect-url URL
+```
+
+`LABEL` names the bank login (lowercase letters, digits and dashes, e.g. `n26`);
+re-consent reuses it and replaces only that session. `--redirect-url` must be one
+registered on the Enable Banking app. The command prints the bank's URL; approve
+access there, then paste back the full URL the browser lands on (the page itself may
+not load; only the URL matters). The session goes to `$STATE_DIR/sessions/LABEL.json`,
+so re-consent needs no secret and no PR. The consent validity asked for is the bank's
+published maximum.
+
+## Configuration
+
+| Env var | Meaning |
+|---------|---------|
+| `ENABLE_BANKING_APP_ID`, `ENABLE_BANKING_PRIVATE_KEY_PATH` | Enable Banking app and its `.pem` |
+| `FIREFLY_URL`, `FIREFLY_TOKEN` | Firefly III API |
+| `STATE_DIR` | state directory, default `/state` |
+| `FETCH_CRON` | schedule for `serve`; unset registers the deployment without one |
+| `FIREFLY_WRITE` | `true` or `false` (default). Until `true`, runs only fetch and save raw pages |
+| `MAPPING_CONFIG` | mapping rules file, default `/config/mapping.toml`; no file means no rules |
+| `PUSHGATEWAY_URL` | metrics; unset means none are pushed |
+
+Metrics, both in Pushgateway group `transaction-pipeline`:
+`transaction_pipeline_consent_valid_until_timestamp{session="LABEL"}` on every run, and
+`transaction_pipeline_last_success_timestamp` after a run that stored into Firefly
+(never in save-only mode, so a staleness alert keeps firing until the first real import).
+
+## State
+
+`STATE_DIR` (default `/state`, a PVC in the cluster):
+
+- `sessions/<label>.json`: one Enable Banking session per bank login, with the bank
+  name and country used. The flow fetches every account of every session.
+- `raw/<flow-run-id>/<account-uid>/page-<n>.json`: every transaction page as the
+  bank returned it, written before anything is mapped. The store step reads them back,
+  so it retries (on Firefly errors only) without spending the bank budget.
+
+Both are personal financial data: owner-only files, never passed through Prefect. With
+`FIREFLY_WRITE=true`, a run's raw pages are deleted once stored, and a failed run's
+stay 7 days for debugging. In save-only mode raw pages are kept: they are what the
+mapping rules are written from. A save-only run marks its directory with a
+`save-only` file, and pruning never deletes a marked directory, so the backfill
+survives until it is replayed. The save-only runs left over after go-live are deleted
+by hand.
+
+**Backfill at go-live.** The first fetch right after consent is exempt from the PSD2
+budget and gets the most history, so it runs save-only with a large `window_days`
+(e.g. 1095) and its pages stay on the PVC. After the clean start, the flow parameter
+`replay_run=<run-id>` maps and stores that run's pages without fetching. It honours
+`FIREFLY_WRITE`: when that is off, it maps only and stores nothing, which checks the
+rules against real data. A replay never prunes and pushes no success timestamp. A
+replay that writes deletes the replayed pages once they are stored. It is for the backfill only: failure recovery is the overlapping
+window. A run saved before a re-consent can't be replayed, because accounts get new
+uids on re-consent.
+
+One bank login failing (expired consent, rate limit) doesn't stop the others: their
+transactions are still stored, and the run then fails naming what went wrong.
 
 ## Data rule
 
