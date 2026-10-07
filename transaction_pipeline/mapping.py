@@ -24,9 +24,14 @@ repo), and checked in order:
     account = "Holiday pot"           # Firefly asset account name
     name = "^holiday pot$"            # regex on the counterparty name
     remittance = "pot transfer"       # regex on the remittance text
+    iban = "XX00..."                  # optional, see below
 
 A rule needs `account` and at least one of `name` and `remittance`; all of the
-patterns it gives must match (searched, case-insensitive).
+patterns it gives must match (searched, case-insensitive). The payer chooses the
+name and remittance text, so a rule without `iban` only applies when the
+counterparty shows no IBAN or the booking account's own: a stranger's payment
+carries the stranger's IBAN and can't pose as a sub-account move. Give `iban`
+for an intermediary whose IBAN does appear (the rule then needs that exact one).
 
 `imported_ibans` are the IBANs of the accounts this run fetches from Enable
 Banking. They decide which side of a transfer between own accounts is imported:
@@ -77,6 +82,7 @@ class CounterpartyRule:
     account: str
     name: re.Pattern | None = None
     remittance: re.Pattern | None = None
+    iban: str | None = None
 
     def matches(self, party_name: str | None, remittance: str) -> bool:
         if self.name is not None and not self.name.search(party_name or ""):
@@ -92,7 +98,7 @@ def load_rules(path: Path | None) -> list[CounterpartyRule]:
         return []
     rules = []
     for i, entry in enumerate(tomllib.loads(path.read_text()).get("own_counterparty", [])):
-        unknown = set(entry) - {"account", "name", "remittance"}
+        unknown = set(entry) - {"account", "name", "remittance", "iban"}
         if unknown or "account" not in entry or not ({"name", "remittance"} & set(entry)):
             raise MappingError(
                 f"{path}: own_counterparty[{i}] needs account plus name and/or remittance"
@@ -103,6 +109,7 @@ def load_rules(path: Path | None) -> list[CounterpartyRule]:
                 account=entry["account"],
                 name=re.compile(entry["name"], re.IGNORECASE) if "name" in entry else None,
                 remittance=re.compile(entry["remittance"], re.IGNORECASE) if "remittance" in entry else None,
+                iban=normalise_iban(entry["iban"]) if "iban" in entry else None,
             )
         )
     return rules
@@ -154,8 +161,10 @@ class AccountBook:
         by_iban = self.get(party_iban)
         if by_iban is not None and by_iban != account:
             return by_iban
+        party_iban = normalise_iban(party_iban or "") or None
         for rule, own in self._rules:
-            if own != account and rule.matches(party_name, remittance):
+            expected = {rule.iban} if rule.iban else {None, account.iban}
+            if own != account and party_iban in expected and rule.matches(party_name, remittance):
                 return own
         return None
 

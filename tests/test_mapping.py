@@ -280,7 +280,7 @@ def test_load_rules_without_a_file_is_empty(tmp_path):
     [
         '[[own_counterparty]]\naccount = "Synthetic pot"\n',
         '[[own_counterparty]]\nname = "pot"\n',
-        '[[own_counterparty]]\naccount = "Synthetic pot"\nname = "pot"\niban = "XX00"\n',
+        '[[own_counterparty]]\naccount = "Synthetic pot"\nname = "pot"\nbic = "XX"\n',
     ],
 )
 def test_load_rules_rejects_incomplete_or_unknown_entries(tmp_path, body):
@@ -289,3 +289,21 @@ def test_load_rules_rejects_incomplete_or_unknown_entries(tmp_path, body):
 
     with pytest.raises(MappingError, match="own_counterparty"):
         load_rules(path)
+
+
+def test_rule_ignores_a_stranger_who_writes_matching_text():
+    raw = _tx(credit_debit_indicator="CRDT", debtor={"name": "Synthetic Pot"}, debtor_account={"iban": GROCER_IBAN})
+
+    assert _split(map_transaction(raw, CHECKING, RULE_BOOK))["type"] == "deposit"
+
+
+def test_rule_with_iban_needs_that_iban():
+    hub_iban = "XX00SYNTHETIC0000000077"
+    rule = CounterpartyRule("Synthetic pot", remittance=re.compile("relay"), iban=hub_iban)
+    book = AccountBook([CHECKING, POT], [(rule, POT)])
+
+    hit = _tx(creditor={"name": "Relay"}, creditor_account={"iban": hub_iban}, remittance_information=["relay 1"])
+    miss = _tx(creditor={"name": "Relay"}, creditor_account=None, remittance_information=["relay 1"])
+
+    assert _split(map_transaction(hit, CHECKING, book))["type"] == "transfer"
+    assert _split(map_transaction(miss, CHECKING, book))["type"] == "withdrawal"
