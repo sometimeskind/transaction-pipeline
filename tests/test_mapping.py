@@ -1,8 +1,17 @@
 """Mapping tests. All fixtures are synthetic, written from the Enable Banking API schema."""
 
+import re
+
 import pytest
 
-from transaction_pipeline.mapping import AccountBook, MappingError, OwnAccount, map_transaction
+from transaction_pipeline.mapping import (
+    AccountBook,
+    CounterpartyRule,
+    MappingError,
+    OwnAccount,
+    load_rules,
+    map_transaction,
+)
 
 CHECKING = OwnAccount("1", "Synthetic checking", "XX00SYNTHETIC0000000001", imported=True)
 SAVINGS = OwnAccount("2", "Synthetic savings", "XX00SYNTHETIC0000000002", imported=True)
@@ -189,3 +198,94 @@ def test_account_book_from_firefly_marks_imported_accounts():
 def test_account_book_fails_when_an_imported_account_is_not_in_firefly():
     with pytest.raises(MappingError, match="no Firefly account"):
         AccountBook.from_firefly([], imported_ibans=[CHECKING.iban])
+
+
+POT = OwnAccount("5", "Synthetic pot", None, imported=False)
+POT_RULE = CounterpartyRule("Synthetic pot", name=re.compile("^synthetic pot$", re.IGNORECASE))
+RULE_BOOK = AccountBook([CHECKING, SAVINGS, POT], [(POT_RULE, POT)])
+
+
+def test_move_into_a_sub_account_matched_by_rule_is_a_transfer():
+    # Some banks show the account's own IBAN on moves to its sub-accounts.
+    raw = _tx(creditor={"name": "Synthetic Pot"}, creditor_account={"iban": CHECKING.iban})
+
+    split = _split(map_transaction(raw, CHECKING, RULE_BOOK))
+
+    assert split["type"] == "transfer"
+    assert (split["source_id"], split["destination_id"]) == ("1", "5")
+
+
+def test_move_back_from_a_sub_account_is_a_transfer_into_the_account():
+    raw = _tx(credit_debit_indicator="CRDT", debtor={"name": "Synthetic Pot"}, debtor_account=None)
+
+    split = _split(map_transaction(raw, CHECKING, RULE_BOOK))
+
+    assert split["type"] == "transfer"
+    assert (split["source_id"], split["destination_id"]) == ("5", "1")
+
+
+def test_rule_needs_every_pattern_it_gives():
+    rule = CounterpartyRule("Synthetic pot", name=re.compile("pot"), remittance=re.compile("^move$"))
+    book = AccountBook([CHECKING, POT], [(rule, POT)])
+    raw = _tx(creditor={"name": "pot"}, remittance_information=["other text"])
+
+    assert _split(map_transaction(raw, CHECKING, book))["type"] == "withdrawal"
+
+
+def test_iban_match_wins_over_a_rule():
+    rule = CounterpartyRule("Synthetic pot", name=re.compile("."))
+    book = AccountBook([CHECKING, SAVINGS, POT], [(rule, POT)])
+    raw = _tx(creditor={"name": "Me"}, creditor_account={"iban": SAVINGS.iban})
+
+    assert _split(map_transaction(raw, CHECKING, book))["destination_id"] == "2"
+
+
+def test_rules_resolve_firefly_accounts_by_name():
+    accounts = [
+        {"id": "1", "attributes": {"name": "Synthetic checking", "iban": CHECKING.iban}},
+        {"id": "5", "attributes": {"name": "Synthetic pot", "iban": None}},
+    ]
+
+    book = AccountBook.from_firefly(accounts, [CHECKING.iban], rules=[POT_RULE])
+
+    assert book.own_counterparty(CHECKING, "synthetic pot", None, "") == POT
+
+
+def test_rule_naming_a_missing_firefly_account_fails():
+    with pytest.raises(MappingError, match="doesn't exist"):
+        AccountBook.from_firefly([], [], rules=[POT_RULE])
+
+
+def test_load_rules_reads_toml(tmp_path):
+    path = tmp_path / "rules.toml"
+    path.write_text(
+        '[[own_counterparty]]\naccount = "Synthetic pot"\nname = "^Synthetic Pot$"\n'
+        '[[own_counterparty]]\naccount = "Synthetic pot"\nremittance = "to pot"\n'
+    )
+
+    rules = load_rules(path)
+
+    assert [r.account for r in rules] == ["Synthetic pot", "Synthetic pot"]
+    assert rules[0].matches("synthetic pot", "")
+    assert rules[1].matches(None, "move TO POT 3")
+
+
+def test_load_rules_without_a_file_is_empty(tmp_path):
+    assert load_rules(tmp_path / "absent.toml") == []
+    assert load_rules(None) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[[own_counterparty]]\naccount = "Synthetic pot"\n',
+        '[[own_counterparty]]\nname = "pot"\n',
+        '[[own_counterparty]]\naccount = "Synthetic pot"\nname = "pot"\niban = "XX00"\n',
+    ],
+)
+def test_load_rules_rejects_incomplete_or_unknown_entries(tmp_path, body):
+    path = tmp_path / "rules.toml"
+    path.write_text(body)
+
+    with pytest.raises(MappingError, match="own_counterparty"):
+        load_rules(path)

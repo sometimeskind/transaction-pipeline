@@ -8,9 +8,25 @@ POST /v1/transactions, ready for `FireflyClient.store_if_absent`.
 
 Used by the flow:
 
-    book = AccountBook.from_firefly(firefly.accounts("asset"), imported_ibans=[...])
+    rules = load_rules(path)                                 # [] when the file is absent
+    book = AccountBook.from_firefly(firefly.accounts("asset"), imported_ibans=[...], rules=rules)
     own = book.get(session_account["account_id"]["iban"])   # this feed's account
     payload = map_transaction(raw_transaction, own, book)   # dict, or None to skip
+
+A counterparty is an own account, and the booking a transfer, when its IBAN is
+on a Firefly asset account, or else when it matches a rule from the rules file.
+Rules cover own accounts that bookings don't name by IBAN, such as sub-accounts
+inside a bank account or a payment service in the middle of a transfer. The
+file is TOML, kept with the deployment (the real accounts never go in this
+repo), and checked in order:
+
+    [[own_counterparty]]
+    account = "Holiday pot"           # Firefly asset account name
+    name = "^holiday pot$"            # regex on the counterparty name
+    remittance = "pot transfer"       # regex on the remittance text
+
+A rule needs `account` and at least one of `name` and `remittance`; all of the
+patterns it gives must match (searched, case-insensitive).
 
 `imported_ibans` are the IBANs of the accounts this run fetches from Enable
 Banking. They decide which side of a transfer between own accounts is imported:
@@ -29,9 +45,12 @@ direction) raises `MappingError`, so the flow fails rather than guessing.
 from __future__ import annotations
 
 import logging
+import re
+import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -47,32 +66,98 @@ class MappingError(Exception):
 class OwnAccount:
     firefly_id: str
     name: str
-    iban: str
+    iban: str | None
     imported: bool
 
 
-class AccountBook:
-    """Own Firefly accounts, indexed by normalised IBAN."""
+@dataclass(frozen=True)
+class CounterpartyRule:
+    """A counterparty matching these patterns is the own account named `account`."""
 
-    def __init__(self, accounts: Iterable[OwnAccount]):
-        self._by_iban = {a.iban: a for a in accounts}
+    account: str
+    name: re.Pattern | None = None
+    remittance: re.Pattern | None = None
+
+    def matches(self, party_name: str | None, remittance: str) -> bool:
+        if self.name is not None and not self.name.search(party_name or ""):
+            return False
+        if self.remittance is not None and not self.remittance.search(remittance):
+            return False
+        return True
+
+
+def load_rules(path: Path | None) -> list[CounterpartyRule]:
+    """Rules from the TOML file at `path` (format in the module docstring); [] when there is none."""
+    if path is None or not path.exists():
+        return []
+    rules = []
+    for i, entry in enumerate(tomllib.loads(path.read_text()).get("own_counterparty", [])):
+        unknown = set(entry) - {"account", "name", "remittance"}
+        if unknown or "account" not in entry or not ({"name", "remittance"} & set(entry)):
+            raise MappingError(
+                f"{path}: own_counterparty[{i}] needs account plus name and/or remittance"
+                + (f", and has unknown keys {sorted(unknown)}" if unknown else "")
+            )
+        rules.append(
+            CounterpartyRule(
+                account=entry["account"],
+                name=re.compile(entry["name"], re.IGNORECASE) if "name" in entry else None,
+                remittance=re.compile(entry["remittance"], re.IGNORECASE) if "remittance" in entry else None,
+            )
+        )
+    return rules
+
+
+class AccountBook:
+    """Own Firefly accounts, found by normalised IBAN or by counterparty rule."""
+
+    def __init__(self, accounts: Iterable[OwnAccount], rules: Iterable[tuple[CounterpartyRule, OwnAccount]] = ()):
+        accounts = list(accounts)
+        self._by_iban = {a.iban: a for a in accounts if a.iban}
+        self._rules = list(rules)
 
     @classmethod
-    def from_firefly(cls, accounts: Iterable[dict], imported_ibans: Iterable[str]) -> AccountBook:
-        """Build from Firefly `data` items (FireflyClient.accounts). Accounts without an IBAN are left out."""
+    def from_firefly(
+        cls,
+        accounts: Iterable[dict],
+        imported_ibans: Iterable[str],
+        rules: Iterable[CounterpartyRule] = (),
+    ) -> AccountBook:
+        """Build from Firefly `data` items (FireflyClient.accounts) and the rules from `load_rules`."""
         imported = {normalise_iban(i) for i in imported_ibans}
         own = []
         for item in accounts:
-            iban = normalise_iban(item["attributes"].get("iban") or "")
-            if iban:
-                own.append(OwnAccount(item["id"], item["attributes"]["name"], iban, iban in imported))
+            iban = normalise_iban(item["attributes"].get("iban") or "") or None
+            own.append(OwnAccount(item["id"], item["attributes"]["name"], iban, iban in imported))
         missing = imported - {a.iban for a in own}
         if missing:
             raise MappingError(f"{len(missing)} imported account(s) have no Firefly account with that IBAN")
-        return cls(own)
+        by_name = {a.name: a for a in own}
+        resolved = []
+        for rule in rules:
+            if rule.account not in by_name:
+                raise MappingError(f"rule names Firefly account {rule.account!r}, which doesn't exist")
+            resolved.append((rule, by_name[rule.account]))
+        return cls(own, resolved)
 
     def get(self, iban: str | None) -> OwnAccount | None:
         return self._by_iban.get(normalise_iban(iban or ""))
+
+    def own_counterparty(
+        self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str
+    ) -> OwnAccount | None:
+        """The own account on the other side of a booking on `account`, if it is one.
+
+        A match on `account` itself doesn't count: some banks show the account's own
+        IBAN on moves to and from its sub-accounts, and those are what rules are for.
+        """
+        by_iban = self.get(party_iban)
+        if by_iban is not None and by_iban != account:
+            return by_iban
+        for rule, own in self._rules:
+            if own != account and rule.matches(party_name, remittance):
+                return own
+        return None
 
 
 def normalise_iban(iban: str) -> str:
@@ -103,9 +188,7 @@ def map_transaction(raw: dict, account: OwnAccount, book: AccountBook) -> dict |
     )
     party_name = ((party or {}).get("name") or "").strip() or None
     party_iban, party_number = _account_identifiers(party_account)
-    other_own = book.get(party_iban)
-    if other_own is not None and other_own.iban == account.iban:
-        other_own = None
+    other_own = book.own_counterparty(account, party_name, party_iban, _remittance(raw))
 
     split: dict = {
         "date": booking_date,
@@ -169,10 +252,13 @@ def _counterparty(side: str, name: str | None, iban: str | None, number: str | N
     return {k: v for k, v in fields.items() if v}
 
 
+def _remittance(raw: dict) -> str:
+    return " ".join(" ".join(raw.get("remittance_information") or []).split())
+
+
 def _description(raw: dict, party_name: str | None) -> str:
     """Stable: the same raw transaction always gives the same text."""
-    remittance = raw.get("remittance_information") or []
-    text = " ".join(" ".join(remittance).split())
+    text = _remittance(raw)
     if not text:
         text = party_name or ((raw.get("bank_transaction_code") or {}).get("description") or "").strip()
     return (text or NO_DESCRIPTION)[:DESCRIPTION_MAX]
