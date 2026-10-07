@@ -58,6 +58,16 @@ Both are personal financial data: owner-only files, never passed through Prefect
 stay 7 days for debugging. In save-only mode raw pages are kept: they are what the
 mapping rules are written from.
 
+**Backfill at go-live.** The first fetch right after consent is exempt from the PSD2
+budget and gets the most history, so it runs save-only with a large `window_days`
+(e.g. 1095) and its pages stay on the PVC. After the clean start, the flow parameter
+`replay_run=<run-id>` maps and stores that run's pages without fetching. It honours
+`FIREFLY_WRITE`: when that is off, it maps only and stores nothing, which checks the
+rules against real data. A replay never prunes, leaves the pages in place, and pushes
+no success timestamp. It is for the backfill only: failure recovery is the overlapping
+window. A run saved before a re-consent can't be replayed, because accounts get new
+uids on re-consent.
+
 One bank login failing (expired consent, rate limit) doesn't stop the others: their
 transactions are still stored, and the run then fails naming what went wrong.
 

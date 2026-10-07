@@ -19,6 +19,12 @@ paths and dates only, and no result is persisted to Prefect's result storage.
 A run's raw pages are deleted once they are stored; a failed run's pages stay
 as evidence for RAW_KEEP_FAILED_DAYS, then the next run deletes them.
 
+`replay_run=<run-id>` maps and stores a saved run directory without fetching
+anything: the go-live backfill is fetched once in save-only mode right after
+consent, and replayed after the clean start. It is not a failure-recovery
+mechanism (the overlapping window is), never prunes, and leaves the replayed
+pages in place.
+
 FIREFLY_WRITE (default false) is the go-live switch. Until it is "true", runs
 only fetch and save raw pages, which are kept (they are what the mapping rules
 are written from), and push no success timestamp, so the staleness alert keeps
@@ -65,6 +71,8 @@ RAW_KEEP_FAILED_DAYS = 7
 CONSENT_HINT = "run `python -m transaction_pipeline consent {label} ...` in the transaction-pipeline pod"
 # A session label names a file and a Prometheus label value: keep it plain.
 LABEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+# Flow run ids are UUIDs; runs outside Prefect are "manual-<timestamp>".
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class ConsentNeededError(RuntimeError):
@@ -200,11 +208,37 @@ def save_pages(
     return fetched
 
 
+def saved_pages(run_dir: Path, sessions: dict[str, dict]) -> dict[str, list[Path]]:
+    """The pages a run saved, per account uid, in page order.
+
+    Fails on an account directory that no session knows: Enable Banking gives
+    accounts new uids on re-consent, and silently replaying nothing for them
+    would look like success.
+    """
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"no saved run at {run_dir}")
+    known = {a["uid"] for a in all_accounts(sessions)}
+    pages = {
+        d.name: sorted(d.glob("page-*.json"), key=lambda p: int(p.stem.removeprefix("page-")))
+        for d in sorted(run_dir.iterdir())
+        if d.is_dir()
+    }
+    unknown = sorted(set(pages) - known)
+    if unknown:
+        raise RuntimeError(
+            f"run {run_dir.name} has pages for {len(unknown)} account(s) no current session knows "
+            f"({', '.join(unknown)}); re-consent gives accounts new uids, so this run can't be replayed"
+        )
+    return pages
+
+
 @dataclass(frozen=True)
 class StoreCounts:
     created: int = 0
     existing: int = 0
     skipped: int = 0
+    # Mapped but not stored, because FIREFLY_WRITE is off (replay only).
+    not_written: int = 0
 
 
 def store_from_disk(
@@ -212,6 +246,8 @@ def store_from_disk(
     sessions: dict[str, dict],
     pages: dict[str, list[Path]],
     rules: list | None = None,
+    *,
+    write: bool = True,
 ) -> StoreCounts:
     """Map every saved transaction and store it in Firefly unless its external_id is there already.
 
@@ -222,7 +258,7 @@ def store_from_disk(
     book = mapping.AccountBook.from_firefly(
         client.accounts("asset"), imported_ibans=[account_iban(a) for a in accounts], rules=rules or []
     )
-    created = existing = skipped = 0
+    created = existing = skipped = not_written = 0
     for account in accounts:
         if account["uid"] not in pages:
             continue
@@ -234,11 +270,13 @@ def store_from_disk(
                 payload = mapping.map_transaction(raw, own, book)
                 if payload is None:
                     skipped += 1
+                elif not write:
+                    not_written += 1
                 elif client.store_if_absent(payload).created:
                     created += 1
                 else:
                     existing += 1
-    return StoreCounts(created, existing, skipped)
+    return StoreCounts(created, existing, skipped, not_written)
 
 
 def is_transient(exc: BaseException) -> bool:
@@ -271,12 +309,15 @@ def fetch_pages(run_dir: Path, date_from: date, date_to: date) -> Fetched:
     cache_policy=NO_CACHE,
     persist_result=False,
 )
-def store_pages(pages: dict[str, list[Path]]) -> StoreCounts:
+def store_pages(pages: dict[str, list[Path]], write: bool = True) -> StoreCounts:
     sessions = load_sessions(sessions_dir())
     rules = mapping.load_rules(mapping_config())
     with firefly_client() as client:
-        counts = store_from_disk(client, sessions, pages, rules)
-    log.info("stored %d new, %d already in Firefly, %d skipped", counts.created, counts.existing, counts.skipped)
+        counts = store_from_disk(client, sessions, pages, rules, write=write)
+    log.info(
+        "stored %d new, %d already in Firefly, %d skipped, %d mapped but not written",
+        counts.created, counts.existing, counts.skipped, counts.not_written,
+    )
     return counts
 
 
@@ -296,11 +337,17 @@ def run_id() -> str:
 
 
 @flow(name="transaction-import", persist_result=False)
-def import_flow(window_days: int = WINDOW_DAYS) -> None:
-    """Fetch booked transactions from Enable Banking and write them to Firefly III."""
+def import_flow(window_days: int = WINDOW_DAYS, replay_run: str | None = None) -> None:
+    """Fetch booked transactions from Enable Banking and write them to Firefly III.
+
+    With `replay_run`, map and store that saved run's pages instead of fetching.
+    """
     write = firefly_write()
     sessions = load_sessions(sessions_dir())
     metrics.push_consent_valid_until({label: consent_valid_until(s) for label, s in sessions.items()})
+    if replay_run is not None:
+        replay(replay_run, sessions, write)
+        return
     if write:
         prune_failed_runs(raw_root())
     today = datetime.now(UTC).date()
@@ -318,3 +365,17 @@ def import_flow(window_days: int = WINDOW_DAYS) -> None:
         # Stored, so Firefly has it all: don't keep a copy of the bank feed at rest.
         shutil.rmtree(run_dir, ignore_errors=True)
         metrics.push_success()
+
+
+def replay(replay_run: str, sessions: dict[str, dict], write: bool) -> None:
+    """Map (and with `write`, store) a saved run. No fetch, no pruning, pages left in place.
+
+    Pushes no success timestamp: that says the daily import is current, and a
+    replay fetches nothing new.
+    """
+    if not RUN_ID_PATTERN.fullmatch(replay_run):
+        raise ValueError(f"replay_run {replay_run!r} is not a run id")
+    pages = saved_pages(raw_root() / replay_run, sessions)
+    if not write:
+        log.warning("FIREFLY_WRITE is not true: replaying run %s maps only, stores nothing", replay_run)
+    store_pages(pages, write)

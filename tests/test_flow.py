@@ -91,7 +91,7 @@ def test_nothing_is_persisted_to_prefect_result_storage():
 
 def test_tasks_take_no_session_or_transaction_data():
     assert set(flow.fetch_pages.fn.__annotations__) - {"return"} == {"run_dir", "date_from", "date_to"}
-    assert set(flow.store_pages.fn.__annotations__) - {"return"} == {"pages"}
+    assert set(flow.store_pages.fn.__annotations__) - {"return"} == {"pages", "write"}
 
 
 def test_sessions_live_one_file_per_label(state):
@@ -254,6 +254,35 @@ def test_a_rerun_from_the_same_pages_creates_nothing(tmp_path, fake_mapping):
     assert flow.store_from_disk(firefly, SESSIONS, fetched.pages) == flow.StoreCounts(existing=1)
 
 
+def test_store_without_write_maps_but_stores_nothing(tmp_path, fake_mapping):
+    fetched = flow.save_pages(FakeBank({UID_A: [{"transactions": [tx("a1"), tx("skip1")]}], **empty(UID_B, UID_C)}),
+                              SESSIONS, tmp_path, FROM, TO)
+    firefly = FakeFirefly()
+    assert flow.store_from_disk(firefly, SESSIONS, fetched.pages, write=False) == flow.StoreCounts(
+        skipped=1, not_written=1)
+    assert firefly.stored == []
+
+
+def test_saved_pages_come_back_per_account_in_page_order(tmp_path):
+    for n in (1, 2, 10):
+        flow.write_json(tmp_path / "run-1" / UID_A / f"page-{n}.json", {"transactions": []})
+    flow.write_json(tmp_path / "run-1" / UID_C / "page-1.json", {"transactions": []})
+    pages = flow.saved_pages(tmp_path / "run-1", SESSIONS)
+    assert [p.name for p in pages[UID_A]] == ["page-1.json", "page-2.json", "page-10.json"]
+    assert set(pages) == {UID_A, UID_C}
+
+
+def test_a_saved_run_with_accounts_no_session_knows_is_refused(tmp_path):
+    flow.write_json(tmp_path / "run-1" / "00000000-0000-4000-8000-0000000000ff" / "page-1.json", {})
+    with pytest.raises(RuntimeError, match="re-consent"):
+        flow.saved_pages(tmp_path / "run-1", SESSIONS)
+
+
+def test_a_missing_saved_run_is_refused(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        flow.saved_pages(tmp_path / "run-1", SESSIONS)
+
+
 def test_a_session_account_without_iban_fails():
     sessions = {"bank-one": {**SESSIONS["bank-one"], "accounts": [{"uid": UID_A, "account_id": {}}]}}
     with pytest.raises(mapping.MappingError, match="no IBAN"):
@@ -304,14 +333,17 @@ class FlowHarness:
             return Fetched({UID_A: [run_dir / UID_A / "page-1.json"]}, list(errors))
 
         monkeypatch.setattr(flow, "fetch_pages", fetch_pages)
-        monkeypatch.setattr(flow, "store_pages", lambda pages: self.events.append(("store", sorted(pages))))
+        monkeypatch.setattr(flow, "store_pages", self.store_pages)
         monkeypatch.setattr(flow, "prune_failed_runs", lambda root: self.events.append("prune"))
         monkeypatch.setattr(flow, "run_id", lambda: "run-1")
         monkeypatch.setattr(metrics, "push_consent_valid_until", lambda v: self.events.append(("consent", v)))
         monkeypatch.setattr(metrics, "push_success", lambda: self.events.append("success"))
 
-    def run(self):
-        import_flow.fn()
+    def store_pages(self, pages, write=True):
+        self.events.append(("store", sorted(pages)) if write else ("map-only", sorted(pages)))
+
+    def run(self, **params):
+        import_flow.fn(**params)
 
 
 CONSENT = ("consent", {"bank-one": 1798761600.0, "bank-two": 1801440000.0})
@@ -369,3 +401,34 @@ def test_metrics_push_to_the_pipeline_job_with_a_session_label(monkeypatch):
     })
     assert pushed[1][0] == "transaction-pipeline"
     assert [name for name, _ in pushed[1][1]] == ["transaction_pipeline_last_success_timestamp"]
+
+
+@pytest.fixture
+def saved_run(state):
+    flow.write_json(state / "raw" / "backfill" / UID_A / "page-1.json", {"transactions": []})
+    flow.write_json(state / "raw" / "backfill" / UID_C / "page-1.json", {"transactions": []})
+    return state / "raw" / "backfill"
+
+
+def test_replay_stores_a_saved_run_without_fetching_pruning_or_deleting(saved_run, monkeypatch):
+    monkeypatch.setenv("FIREFLY_WRITE", "true")
+    harness = FlowHarness(monkeypatch)
+    harness.run(replay_run="backfill")
+    assert harness.events == [CONSENT, ("store", [UID_A, UID_C])]
+    assert harness.run_dir is None
+    assert (saved_run / UID_A / "page-1.json").exists()
+
+
+def test_replay_without_write_maps_only(saved_run, monkeypatch):
+    monkeypatch.delenv("FIREFLY_WRITE", raising=False)
+    harness = FlowHarness(monkeypatch)
+    harness.run(replay_run="backfill")
+    assert harness.events == [CONSENT, ("map-only", [UID_A, UID_C])]
+
+
+@pytest.mark.parametrize("run", ["../sessions", "a/b", ""])
+def test_replay_refuses_anything_but_a_run_id(state, monkeypatch, run):
+    harness = FlowHarness(monkeypatch)
+    with pytest.raises(ValueError, match="not a run id"):
+        harness.run(replay_run=run)
+    assert harness.events == [CONSENT]
