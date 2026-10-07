@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transaction-pipeline"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "prefect>=3.8.7,<4",
+    "httpx>=0.27",
+    "prometheus-client>=0.26.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["transaction_pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+reportMissingImports = false
