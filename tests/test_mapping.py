@@ -145,8 +145,18 @@ def test_unsigned_amount_without_indicator_fails():
         map_transaction(_tx(credit_debit_indicator=None), CHECKING, BOOK)
 
 
-def test_missing_entry_reference_fails():
-    with pytest.raises(MappingError, match="entry_reference"):
+def test_missing_entry_reference_falls_back_to_transaction_id():
+    raw = _tx(entry_reference=None, transaction_id="tid-1")
+
+    assert _split(map_transaction(raw, CHECKING, BOOK))["external_id"] == "tid-1"
+
+
+def test_entry_reference_wins_over_transaction_id():
+    assert _split(map_transaction(_tx(transaction_id="tid-1"), CHECKING, BOOK))["external_id"] == "ref-1"
+
+
+def test_missing_entry_reference_and_transaction_id_fails():
+    with pytest.raises(MappingError, match="neither entry_reference nor transaction_id"):
         map_transaction(_tx(entry_reference=None), CHECKING, BOOK)
 
 
@@ -270,9 +280,19 @@ def test_load_rules_reads_toml(tmp_path):
     assert rules[1].matches(None, "move TO POT 3")
 
 
-def test_load_rules_without_a_file_is_empty(tmp_path):
+def test_load_rules_without_a_file_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAPPING_CONFIG", str(tmp_path / "absent.toml"))
+
     assert load_rules(tmp_path / "absent.toml") == []
-    assert load_rules(None) == []
+    assert load_rules() == []
+
+
+def test_load_rules_reads_mapping_config(tmp_path, monkeypatch):
+    path = tmp_path / "mapping.toml"
+    path.write_text('[[own_counterparty]]\naccount = "Synthetic pot"\nname = "pot"\n')
+    monkeypatch.setenv("MAPPING_CONFIG", str(path))
+
+    assert [r.account for r in load_rules()] == ["Synthetic pot"]
 
 
 @pytest.mark.parametrize(

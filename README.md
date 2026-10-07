@@ -32,13 +32,32 @@ Prefect review in homelab#1983):
 - **No Prefect retries on the bank fetch.** A retry spends the PSD2 budget. The raw
   Enable Banking response (every `continuation_key` page) is saved to the state PVC
   before mapping, and a failed Firefly write retries from disk, not from the bank.
-- **Idempotency lives in Firefly** (Enable Banking `entry_reference` → Firefly
-  `external_id`), not in Prefect run state. A re-run after a Prefect outage or a lost
+- **Idempotency lives in Firefly** (Enable Banking `entry_reference`, or
+  `transaction_id` when a bank sends none → Firefly `external_id`), not in Prefect
+  run state. A booking with neither fails the run. A re-run after a Prefect outage or a lost
   Prefect database creates no duplicates.
 - **Staleness is alerted without Prefect.** Each successful run pushes
   `transaction_pipeline_last_success_timestamp` to the Pushgateway; the homelab
   alerts on its age. `PrefectDeploymentFailing` can't see a scheduler that stopped
   scheduling.
+
+## Mapping
+
+`mapping.py` turns one raw Enable Banking transaction into one Firefly
+transaction: a withdrawal, a deposit, or a transfer when the other side is an own
+account. Own accounts are found in two ways:
+
+- **By IBAN:** any Firefly asset account with its IBAN set. A transfer between
+  two imported accounts is created once, from its debit side.
+- **By rule:** for own accounts that bookings don't name by IBAN, such as
+  sub-accounts or a payment service in the middle. Rules live in a TOML file at
+  `MAPPING_CONFIG` (default `/config/mapping.toml`). The file is optional, and no
+  file means no rules. The deployment mounts it from a secret, because the real
+  rules describe our accounts and never go in this repo. The format is in the
+  `mapping.py` docstring.
+
+`firefly.py` stores each transaction only when no transaction with its
+`external_id` exists, and never updates an existing one.
 
 ## Development
 

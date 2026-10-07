@@ -8,7 +8,7 @@ POST /v1/transactions, ready for `FireflyClient.store_if_absent`.
 
 Used by the flow:
 
-    rules = load_rules(path)                                 # [] when the file is absent
+    rules = load_rules()                                     # MAPPING_CONFIG; [] when the file is absent
     book = AccountBook.from_firefly(firefly.accounts("asset"), imported_ibans=[...], rules=rules)
     own = book.get(session_account["account_id"]["iban"])   # this feed's account
     payload = map_transaction(raw_transaction, own, book)   # dict, or None to skip
@@ -17,8 +17,9 @@ A counterparty is an own account, and the booking a transfer, when its IBAN is
 on a Firefly asset account, or else when it matches a rule from the rules file.
 Rules cover own accounts that bookings don't name by IBAN, such as sub-accounts
 inside a bank account or a payment service in the middle of a transfer. The
-file is TOML, kept with the deployment (the real accounts never go in this
-repo), and checked in order:
+file is TOML at `MAPPING_CONFIG` (default /config/mapping.toml), optional: no
+file means no rules. The deployment mounts it from a secret; the real accounts
+never go in this repo. Rules are checked in order:
 
     [[own_counterparty]]
     account = "Holiday pot"           # Firefly asset account name
@@ -42,14 +43,19 @@ Banking. They decide which side of a transfer between own accounts is imported:
   account is only in Firefly (not fetched), the credit is the only side we ever
   see, so it becomes the transfer.
 
+The Firefly `external_id`, the idempotency key, is the `entry_reference`, or the
+`transaction_id` when the bank sends no `entry_reference`.
+
 `map_transaction` also returns None for a zero amount, which Firefly rejects.
-Anything it can't map safely (no `entry_reference`, no booking date, no
-direction) raises `MappingError`, so the flow fails rather than guessing.
+Anything it can't map safely (neither `entry_reference` nor `transaction_id`, no
+booking date, no direction) raises `MappingError`, so the flow fails rather than
+guessing.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import tomllib
 from collections.abc import Iterable
@@ -59,6 +65,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+DEFAULT_RULES_PATH = "/config/mapping.toml"
 DESCRIPTION_MAX = 1000
 NO_DESCRIPTION = "(no description)"
 
@@ -92,9 +99,15 @@ class CounterpartyRule:
         return True
 
 
-def load_rules(path: Path | None) -> list[CounterpartyRule]:
-    """Rules from the TOML file at `path` (format in the module docstring); [] when there is none."""
-    if path is None or not path.exists():
+def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
+    """Rules from the TOML file at `path`, else at MAPPING_CONFIG (format in the module docstring).
+
+    Returns [] when the file doesn't exist.
+    """
+    if path is None:
+        path = Path(os.environ.get("MAPPING_CONFIG") or DEFAULT_RULES_PATH)
+    if not path.exists():
+        log.info("no mapping rules at %s", path)
         return []
     rules = []
     for i, entry in enumerate(tomllib.loads(path.read_text()).get("own_counterparty", [])):
@@ -175,9 +188,11 @@ def normalise_iban(iban: str) -> str:
 
 def map_transaction(raw: dict, account: OwnAccount, book: AccountBook) -> dict | None:
     """The Firefly store payload for `raw`, booked on `account`; None to skip it (see module docstring)."""
-    external_id = raw.get("entry_reference")
+    external_id = raw.get("entry_reference") or raw.get("transaction_id")
     if not external_id:
-        raise MappingError("transaction has no entry_reference, so it can't be stored idempotently")
+        raise MappingError(
+            "transaction has neither entry_reference nor transaction_id, so it can't be stored idempotently"
+        )
     booking_date = raw.get("booking_date") or raw.get("value_date")
     if not booking_date:
         raise MappingError(f"transaction {external_id} has no booking_date or value_date")
