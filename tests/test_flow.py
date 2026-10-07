@@ -316,6 +316,16 @@ def test_failed_runs_are_pruned_after_the_keep_period(tmp_path):
     assert (recent / UID_A / "page-1.json").exists()
 
 
+def test_save_only_runs_are_never_pruned(tmp_path):
+    now = 1_800_000_000
+    run_dir = tmp_path / "backfill"
+    flow.write_json(run_dir / flow.SAVE_ONLY_MARKER, {})
+    flow.write_json(run_dir / UID_A / "page-1.json", {"transactions": []})
+    os.utime(run_dir, (now - 365 * 86400,) * 2)
+    flow.prune_failed_runs(tmp_path, now=now)
+    assert (run_dir / UID_A / "page-1.json").exists()
+
+
 def test_pruning_without_a_raw_dir_is_a_no_op(tmp_path):
     flow.prune_failed_runs(tmp_path / "raw")
 
@@ -355,6 +365,7 @@ def test_save_only_keeps_pages_stores_nothing_and_pushes_no_success(state, monke
     harness.run()
     assert harness.events == [CONSENT]
     assert (state / "raw" / "run-1" / UID_A / "page-1.json").exists()
+    assert (state / "raw" / "run-1" / flow.SAVE_ONLY_MARKER).exists()
 
 
 def test_write_stores_deletes_the_pages_and_pushes_success(state, monkeypatch):
@@ -363,6 +374,14 @@ def test_write_stores_deletes_the_pages_and_pushes_success(state, monkeypatch):
     harness.run()
     assert harness.events == [CONSENT, "prune", ("store", [UID_A]), "success"]
     assert not (state / "raw" / "run-1").exists()
+
+
+def test_a_write_run_leaves_no_save_only_marker(state, monkeypatch):
+    monkeypatch.setenv("FIREFLY_WRITE", "true")
+    harness = FlowHarness(monkeypatch, errors=[BankBudgetSpentError("budget spent")])
+    with pytest.raises(BankBudgetSpentError):
+        harness.run()
+    assert not (state / "raw" / "run-1" / flow.SAVE_ONLY_MARKER).exists()
 
 
 def test_a_fetch_error_stores_the_rest_then_fails_and_keeps_the_pages(state, monkeypatch):
@@ -410,13 +429,14 @@ def saved_run(state):
     return state / "raw" / "backfill"
 
 
-def test_replay_stores_a_saved_run_without_fetching_pruning_or_deleting(saved_run, monkeypatch):
+def test_replay_stores_a_saved_run_without_fetching_or_pruning_then_deletes_it(saved_run, monkeypatch):
+    flow.write_json(saved_run / flow.SAVE_ONLY_MARKER, {})
     monkeypatch.setenv("FIREFLY_WRITE", "true")
     harness = FlowHarness(monkeypatch)
     harness.run(replay_run="backfill")
     assert harness.events == [CONSENT, ("store", [UID_A, UID_C])]
     assert harness.run_dir is None
-    assert (saved_run / UID_A / "page-1.json").exists()
+    assert not saved_run.exists()
 
 
 def test_replay_without_write_maps_only(saved_run, monkeypatch):
@@ -424,6 +444,7 @@ def test_replay_without_write_maps_only(saved_run, monkeypatch):
     harness = FlowHarness(monkeypatch)
     harness.run(replay_run="backfill")
     assert harness.events == [CONSENT, ("map-only", [UID_A, UID_C])]
+    assert (saved_run / UID_A / "page-1.json").exists()
 
 
 @pytest.mark.parametrize("run", ["../sessions", "a/b", ""])

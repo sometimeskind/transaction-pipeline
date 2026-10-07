@@ -56,15 +56,18 @@ Metrics, both in Pushgateway group `transaction-pipeline`:
 Both are personal financial data: owner-only files, never passed through Prefect. With
 `FIREFLY_WRITE=true`, a run's raw pages are deleted once stored, and a failed run's
 stay 7 days for debugging. In save-only mode raw pages are kept: they are what the
-mapping rules are written from.
+mapping rules are written from. A save-only run marks its directory with a
+`save-only` file, and pruning never deletes a marked directory, so the backfill
+survives until it is replayed. The save-only runs left over after go-live are deleted
+by hand.
 
 **Backfill at go-live.** The first fetch right after consent is exempt from the PSD2
 budget and gets the most history, so it runs save-only with a large `window_days`
 (e.g. 1095) and its pages stay on the PVC. After the clean start, the flow parameter
 `replay_run=<run-id>` maps and stores that run's pages without fetching. It honours
 `FIREFLY_WRITE`: when that is off, it maps only and stores nothing, which checks the
-rules against real data. A replay never prunes, leaves the pages in place, and pushes
-no success timestamp. It is for the backfill only: failure recovery is the overlapping
+rules against real data. A replay never prunes and pushes no success timestamp. A
+replay that writes deletes the replayed pages once they are stored. It is for the backfill only: failure recovery is the overlapping
 window. A run saved before a re-consent can't be replayed, because accounts get new
 uids on re-consent.
 

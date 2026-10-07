@@ -22,8 +22,13 @@ as evidence for RAW_KEEP_FAILED_DAYS, then the next run deletes them.
 `replay_run=<run-id>` maps and stores a saved run directory without fetching
 anything: the go-live backfill is fetched once in save-only mode right after
 consent, and replayed after the clean start. It is not a failure-recovery
-mechanism (the overlapping window is), never prunes, and leaves the replayed
-pages in place.
+mechanism (the overlapping window is) and never prunes. A replay that writes
+deletes the replayed pages once stored, like any successful run.
+
+A save-only run marks its directory with a SAVE_ONLY_MARKER file, and pruning
+never touches a marked directory: the backfill must survive until it is
+replayed, however long go-live takes. The operator deletes the save-only runs
+left over after go-live.
 
 FIREFLY_WRITE (default false) is the go-live switch. Until it is "true", runs
 only fetch and save raw pages, which are kept (they are what the mapping rules
@@ -71,6 +76,7 @@ RAW_KEEP_FAILED_DAYS = 7
 CONSENT_HINT = "run `python -m transaction_pipeline consent {label} ...` in the transaction-pipeline pod"
 # A session label names a file and a Prometheus label value: keep it plain.
 LABEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+SAVE_ONLY_MARKER = "save-only"
 # Flow run ids are UUIDs; runs outside Prefect are "manual-<timestamp>".
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -322,11 +328,16 @@ def store_pages(pages: dict[str, list[Path]], write: bool = True) -> StoreCounts
 
 
 def prune_failed_runs(root: Path, now: float | None = None) -> None:
-    """Delete raw run dirs that a failed run left behind more than RAW_KEEP_FAILED_DAYS ago."""
+    """Delete raw run dirs that a failed run left behind more than RAW_KEEP_FAILED_DAYS ago.
+
+    Save-only runs (marked with SAVE_ONLY_MARKER) are never pruned.
+    """
     if not root.exists():
         return
     cutoff = (time.time() if now is None else now) - RAW_KEEP_FAILED_DAYS * 86400
     for run_dir in root.iterdir():
+        if (run_dir / SAVE_ONLY_MARKER).exists():
+            continue
         if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff:
             shutil.rmtree(run_dir)
             log.info("deleted raw pages of failed run %s", run_dir.name)
@@ -352,6 +363,9 @@ def import_flow(window_days: int = WINDOW_DAYS, replay_run: str | None = None) -
         prune_failed_runs(raw_root())
     today = datetime.now(UTC).date()
     run_dir = raw_root() / run_id()
+    if not write:
+        # Before the fetch, so even a run that dies mid-fetch is protected from pruning.
+        write_json(run_dir / SAVE_ONLY_MARKER, {"saved_at": datetime.now(UTC).isoformat()})
     fetched = fetch_pages(run_dir, today - timedelta(days=window_days), today)
     if not write:
         log.warning("FIREFLY_WRITE is not true: saved raw pages to %s, stored nothing in Firefly", run_dir)
@@ -368,14 +382,17 @@ def import_flow(window_days: int = WINDOW_DAYS, replay_run: str | None = None) -
 
 
 def replay(replay_run: str, sessions: dict[str, dict], write: bool) -> None:
-    """Map (and with `write`, store) a saved run. No fetch, no pruning, pages left in place.
+    """Map (and with `write`, store and then delete) a saved run. No fetch, no pruning.
 
     Pushes no success timestamp: that says the daily import is current, and a
     replay fetches nothing new.
     """
     if not RUN_ID_PATTERN.fullmatch(replay_run):
         raise ValueError(f"replay_run {replay_run!r} is not a run id")
-    pages = saved_pages(raw_root() / replay_run, sessions)
+    run_dir = raw_root() / replay_run
+    pages = saved_pages(run_dir, sessions)
     if not write:
         log.warning("FIREFLY_WRITE is not true: replaying run %s maps only, stores nothing", replay_run)
     store_pages(pages, write)
+    if write:
+        shutil.rmtree(run_dir, ignore_errors=True)
