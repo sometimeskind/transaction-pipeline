@@ -6,7 +6,8 @@ account information), maps them with logic tuned to our own accounts, and writes
 them through the Firefly III API. It replaces the Firefly III data importer.
 Intent and done-when: [homelab#1981](https://github.com/sometimeskind/homelab/issues/1981).
 
-**Status:** skeleton. The flow exists but does nothing yet.
+**Status:** skeleton. The Enable Banking client (`enable_banking.py`) exists; the flow
+does nothing yet.
 
 ## Data rule
 
