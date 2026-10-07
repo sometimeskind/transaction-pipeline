@@ -6,8 +6,31 @@ account information), maps them with logic tuned to our own accounts, and writes
 them through the Firefly III API. It replaces the Firefly III data importer.
 Intent and done-when: [homelab#1981](https://github.com/sometimeskind/homelab/issues/1981).
 
-**Status:** skeleton. The Enable Banking client (`enable_banking.py`), the Firefly
-client (`firefly.py`) and the mapping (`mapping.py`) exist; the flow does nothing yet.
+**Status:** the flow and the consent command exist; the Firefly client and the mapping
+(`firefly.py`, `mapping.py`) are being written.
+
+## Consent
+
+Consent is given by hand in the running pod, when it is new or has expired:
+
+```
+python -m transaction_pipeline consent --aspsp-name NAME --country CC --redirect-url URL
+```
+
+`--redirect-url` must be one registered on the Enable Banking app. The command prints
+the bank's URL; approve access there, then paste back the full URL the browser lands
+on (the page itself may not load; only the URL matters). The session goes to
+`$STATE_DIR/session.json`, so re-consent needs no secret and no PR. The consent
+validity asked for is the bank's published maximum.
+
+## State
+
+`STATE_DIR` (default `/state`, a PVC in the cluster):
+
+- `session.json`: the Enable Banking session, with the bank name and country used
+- `raw/<flow-run-id>/<account-uid>/page-<n>.json`: every transaction page as the
+  bank returned it, written before anything is mapped. The store step reads them back,
+  so it retries (on Firefly errors only) without spending the bank budget.
 
 ## Data rule
 
