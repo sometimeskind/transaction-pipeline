@@ -32,6 +32,9 @@ validity asked for is the bank's published maximum.
   bank returned it, written before anything is mapped. The store step reads them back,
   so it retries (on Firefly errors only) without spending the bank budget.
 
+Both are personal financial data: owner-only files, never passed through Prefect. A
+run's raw pages are deleted once stored; a failed run's stay 7 days for debugging.
+
 ## Data rule
 
 This repo is public on purpose. **Test data is synthetic, always.** Real

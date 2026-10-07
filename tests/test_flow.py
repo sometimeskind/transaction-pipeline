@@ -189,6 +189,23 @@ def test_a_rerun_from_the_same_pages_creates_nothing(tmp_path, fake_mapping):
     assert flow.store_from_disk(firefly, SESSION, pages) == flow.StoreCounts(existing=1)
 
 
+def test_failed_runs_are_pruned_after_the_keep_period(tmp_path):
+    now = 1_800_000_000
+    old, recent = tmp_path / "old-run", tmp_path / "recent-run"
+    for run_dir, age_days in ((old, flow.RAW_KEEP_FAILED_DAYS + 1), (recent, flow.RAW_KEEP_FAILED_DAYS - 1)):
+        flow.write_json(run_dir / UID_A / "page-1.json", {"transactions": []})
+        os.utime(run_dir, (now - age_days * 86400,) * 2)
+
+    flow.prune_failed_runs(tmp_path, now=now)
+
+    assert not old.exists()
+    assert (recent / UID_A / "page-1.json").exists()
+
+
+def test_pruning_without_a_raw_dir_is_a_no_op(tmp_path):
+    flow.prune_failed_runs(tmp_path / "raw")
+
+
 def test_a_session_account_without_iban_fails(tmp_path):
     session = {**SESSION, "accounts": [{"uid": UID_A, "account_id": {}}]}
     with pytest.raises(mapping.MappingError, match="no IBAN"):

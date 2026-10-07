@@ -14,6 +14,8 @@ Everything under STATE_DIR is personal financial data (the session reads every
 consented account; raw pages carry IBANs, counterparties and amounts). So files
 are owner-only, and none of it passes through Prefect: tasks take and return
 paths and dates only, and no result is persisted to Prefect's result storage.
+A run's raw pages are deleted once they are stored; a failed run's pages stay
+as evidence for RAW_KEEP_FAILED_DAYS, then the next run deletes them.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -46,6 +50,8 @@ WINDOW_DAYS = 7
 # Store retries only: they read the pages from disk, never from the bank.
 STORE_RETRIES = 2
 STORE_RETRY_DELAY_SECONDS = 30
+# Raw pages left behind by a failed run, kept for debugging, then deleted.
+RAW_KEEP_FAILED_DAYS = 7
 
 CONSENT_HINT = "run `python -m transaction_pipeline consent` in the transaction-pipeline pod"
 
@@ -207,6 +213,21 @@ def store_pages(pages: dict[str, list[Path]]) -> StoreCounts:
     return counts
 
 
+def raw_root() -> Path:
+    return state_dir() / "raw"
+
+
+def prune_failed_runs(root: Path, now: float | None = None) -> None:
+    """Delete raw run dirs that a failed run left behind more than RAW_KEEP_FAILED_DAYS ago."""
+    if not root.exists():
+        return
+    cutoff = (time.time() if now is None else now) - RAW_KEEP_FAILED_DAYS * 86400
+    for run_dir in root.iterdir():
+        if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff:
+            shutil.rmtree(run_dir)
+            log.info("deleted raw pages of failed run %s", run_dir.name)
+
+
 def run_id() -> str:
     return flow_run.id or "manual-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
@@ -216,7 +237,11 @@ def import_flow(window_days: int = WINDOW_DAYS) -> None:
     """Fetch booked transactions from Enable Banking and write them to Firefly III."""
     session = load_session(session_path())
     metrics.push_consent_valid_until(consent_valid_until(session))
+    prune_failed_runs(raw_root())
     today = datetime.now(UTC).date()
-    pages = fetch_pages(state_dir() / "raw" / run_id(), today - timedelta(days=window_days), today)
+    run_dir = raw_root() / run_id()
+    pages = fetch_pages(run_dir, today - timedelta(days=window_days), today)
     store_pages(pages)
+    # Stored, so Firefly has it all: don't keep a copy of the bank feed at rest.
+    shutil.rmtree(run_dir, ignore_errors=True)
     metrics.push_success()
