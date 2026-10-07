@@ -1,18 +1,21 @@
 """`python -m transaction_pipeline [serve | consent ...]`.
 
 `serve` (also the default, so the image's bare CMD keeps working) runs the Prefect
-deployment. `consent` is run by hand in the pod when consent is new or expired:
+deployment, scheduled by FETCH_CRON (unset: registered without a schedule).
+`consent` is run by hand in the pod, once per bank login, when consent is new or
+expired:
 
-    python -m transaction_pipeline consent --aspsp-name NAME --country CC --redirect-url URL
+    python -m transaction_pipeline consent LABEL --aspsp-name NAME --country CC --redirect-url URL
 
 It prints the bank's URL, the operator approves in the bank and pastes back the URL
-the browser lands on, and the session goes to STATE_DIR/session.json. No web UI,
-and no reseal per consent.
+the browser lands on, and the session goes to STATE_DIR/sessions/LABEL.json. No
+web UI, and no reseal per consent.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import secrets
 import sys
@@ -34,15 +37,25 @@ FALLBACK_CONSENT_DAYS = 90
 CONSENT_MARGIN = timedelta(minutes=5)
 
 
+log = logging.getLogger(__name__)
+
+
 class ConsentError(Exception):
     pass
+
+
+def session_label(value: str) -> str:
+    if not flow.LABEL_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("lowercase letters, digits and dashes, starting with a letter or digit")
+    return value
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m transaction_pipeline")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("serve", help="run the Prefect deployment (the default)")
-    consent = commands.add_parser("consent", help="consent to the bank and save the session to the state dir")
+    consent = commands.add_parser("consent", help="consent to one bank login and save its session to the state dir")
+    consent.add_argument("label", type=session_label, help="name for this bank login, e.g. n26; re-consent reuses it")
     consent.add_argument("--aspsp-name", required=True, help="bank name exactly as Enable Banking lists it")
     consent.add_argument("--country", required=True, help="bank's two-letter country code")
     consent.add_argument("--redirect-url", required=True, help="a redirect URL registered on the Enable Banking app")
@@ -91,8 +104,8 @@ def run_consent(
         raise ConsentError("no redirect URL given")
     session = client.create_session(code_from_redirect(redirect, state))
     session["aspsp"] = {"name": aspsp["name"], "country": args.country}
-    path = flow.session_path()
-    flow.write_session(path, session)
+    path = flow.session_path(args.label)
+    flow.write_json(path, session)
     print(
         f"Saved the session to {path}: {len(session.get('accounts', []))} account(s), "
         f"valid until {session['access']['valid_until']}",
@@ -107,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     # Flow runs started by serve() inherit the umask.
     os.umask(0o077)
     if args.command in (None, "serve"):
-        flow.import_flow.serve(name="transaction-import")
+        cron = os.environ.get("FETCH_CRON") or None
+        logging.basicConfig(level=logging.INFO)
+        log.info("transaction-import schedule: %s", cron or "none (FETCH_CRON unset)")
+        flow.import_flow.serve(name="transaction-import", cron=cron)
         return 0
     try:
         with flow.enable_banking_client() as client:

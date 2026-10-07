@@ -4,6 +4,8 @@ Prefect schedules and runs it, and is never the source of truth (homelab#1981):
 
 - The bank fetch has no retries. Each run spends one of the 4 unattended requests
   per account per 24h (PSD2 SCA RTS art. 36(5)).
+- Every bank login has its own session, STATE_DIR/sessions/<label>.json (written
+  by `consent <label>`); the flow fetches every account of every session.
 - Every raw page is written to STATE_DIR/raw/<flow-run-id>/<account-uid>/page-<n>.json
   before anything is mapped, and the store step reads the pages back from disk. So
   the store step can retry without touching the bank.
@@ -16,6 +18,11 @@ are owner-only, and none of it passes through Prefect: tasks take and return
 paths and dates only, and no result is persisted to Prefect's result storage.
 A run's raw pages are deleted once they are stored; a failed run's pages stay
 as evidence for RAW_KEEP_FAILED_DAYS, then the next run deletes them.
+
+FIREFLY_WRITE (default false) is the go-live switch. Until it is "true", runs
+only fetch and save raw pages, which are kept (they are what the mapping rules
+are written from), and push no success timestamp, so the staleness alert keeps
+firing until the first real import.
 """
 
 from __future__ import annotations
@@ -23,9 +30,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -37,6 +45,7 @@ from prefect.runtime import flow_run
 from transaction_pipeline import firefly, mapping, metrics
 from transaction_pipeline.enable_banking import (
     EnableBankingClient,
+    EnableBankingError,
     RateLimitedError,
     SessionGoneError,
     load_private_key,
@@ -53,7 +62,9 @@ STORE_RETRY_DELAY_SECONDS = 30
 # Raw pages left behind by a failed run, kept for debugging, then deleted.
 RAW_KEEP_FAILED_DAYS = 7
 
-CONSENT_HINT = "run `python -m transaction_pipeline consent` in the transaction-pipeline pod"
+CONSENT_HINT = "run `python -m transaction_pipeline consent {label} ...` in the transaction-pipeline pod"
+# A session label names a file and a Prometheus label value: keep it plain.
+LABEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 
 
 class ConsentNeededError(RuntimeError):
@@ -68,8 +79,30 @@ def state_dir() -> Path:
     return Path(os.environ.get("STATE_DIR", "/state"))
 
 
-def session_path() -> Path:
-    return state_dir() / "session.json"
+def sessions_dir() -> Path:
+    return state_dir() / "sessions"
+
+
+def session_path(label: str) -> Path:
+    if not LABEL_PATTERN.fullmatch(label):
+        raise ValueError(f"session label {label!r} must be lowercase letters, digits and dashes")
+    return sessions_dir() / f"{label}.json"
+
+
+def raw_root() -> Path:
+    return state_dir() / "raw"
+
+
+def firefly_write() -> bool:
+    value = os.environ.get("FIREFLY_WRITE", "false").strip().lower()
+    if value not in ("true", "false"):
+        # A typo must not silently write, nor silently not write.
+        raise ValueError(f"FIREFLY_WRITE must be true or false, not {value!r}")
+    return value == "true"
+
+
+def mapping_config() -> Path:
+    return Path(os.environ.get("MAPPING_CONFIG", "/config/mapping.toml"))
 
 
 def write_json(path: Path, data: object) -> Path:
@@ -84,15 +117,12 @@ def write_json(path: Path, data: object) -> Path:
     return path
 
 
-def write_session(path: Path, session: dict) -> None:
-    write_json(path, session)
-
-
-def load_session(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
-        raise ConsentNeededError(f"no Enable Banking session at {path}: {CONSENT_HINT}") from None
+def load_sessions(directory: Path) -> dict[str, dict]:
+    """Every session in `directory`, by label (the file name without .json)."""
+    sessions = {p.stem: json.loads(p.read_text()) for p in sorted(directory.glob("*.json"))}
+    if not sessions:
+        raise ConsentNeededError(f"no Enable Banking sessions in {directory}: " + CONSENT_HINT.format(label="<label>"))
+    return sessions
 
 
 def consent_valid_until(session: dict) -> float:
@@ -106,6 +136,10 @@ def account_iban(account: dict) -> str:
     return iban
 
 
+def all_accounts(sessions: dict[str, dict]) -> list[dict]:
+    return [account for session in sessions.values() for account in session["accounts"]]
+
+
 def enable_banking_client() -> EnableBankingClient:
     return EnableBankingClient(
         os.environ["ENABLE_BANKING_APP_ID"],
@@ -117,33 +151,53 @@ def firefly_client() -> firefly.FireflyClient:
     return firefly.FireflyClient(os.environ["FIREFLY_URL"], os.environ["FIREFLY_TOKEN"])
 
 
+@dataclass
+class Fetched:
+    """Pages per account uid for the accounts fetched in full, and what failed."""
+
+    pages: dict[str, list[Path]] = field(default_factory=dict)
+    errors: list[Exception] = field(default_factory=list)
+
+
 def save_pages(
-    client: EnableBankingClient, session: dict, run_dir: Path, date_from: date, date_to: date
-) -> dict[str, list[Path]]:
+    client: EnableBankingClient, sessions: dict[str, dict], run_dir: Path, date_from: date, date_to: date
+) -> Fetched:
     """Fetch every account's booked transactions, writing each page as it arrives.
 
-    Any error stops the run before anything is stored; the pages written so far
-    stay on disk for debugging.
+    One bank login failing doesn't stop the others: a gone session skips the rest
+    of that session's accounts, any other error skips that account. Pages of a
+    failed account stay on disk but are not stored; the caller fails the run.
     """
-    pages: dict[str, list[Path]] = {}
-    for account in session["accounts"]:
-        uid = account["uid"]
-        paths = pages[uid] = []
-        try:
-            for n, page in enumerate(client.transaction_pages(uid, date_from, date_to), start=1):
-                paths.append(write_json(run_dir / uid / f"page-{n}.json", page))
-        except SessionGoneError as exc:
-            raise ConsentNeededError(
-                f"Enable Banking session is gone ({exc.error_code}): {CONSENT_HINT}"
-            ) from exc
-        except RateLimitedError as exc:
-            raise BankBudgetSpentError(
-                f"bank rate limit on account {uid} ({exc.error_code or exc.status_code}): the PSD2 budget "
-                "of 4 unattended requests per account per 24h is spent; don't re-run today, "
-                "the next scheduled run's overlapping window catches up"
-            ) from exc
-        log.info("account %s: %d page(s) saved", uid, len(paths))
-    return pages
+    fetched = Fetched()
+    for label, session in sessions.items():
+        for account in session["accounts"]:
+            uid = account["uid"]
+            paths: list[Path] = []
+            try:
+                for n, page in enumerate(client.transaction_pages(uid, date_from, date_to), start=1):
+                    paths.append(write_json(run_dir / uid / f"page-{n}.json", page))
+            except SessionGoneError as exc:
+                fetched.errors.append(ConsentNeededError(
+                    f"session {label}: Enable Banking session is gone ({exc.error_code}): "
+                    + CONSENT_HINT.format(label=label)
+                ))
+                log.error("%s", fetched.errors[-1])
+                break
+            except RateLimitedError as exc:
+                fetched.errors.append(BankBudgetSpentError(
+                    f"session {label}: bank rate limit on account {uid} ({exc.error_code or exc.status_code}): "
+                    "the PSD2 budget of 4 unattended requests per account per 24h is spent; don't re-run "
+                    "today, the next scheduled run's overlapping window catches up"
+                ))
+                log.error("%s", fetched.errors[-1])
+                continue
+            except EnableBankingError as exc:
+                fetched.errors.append(exc)
+                log.error("session %s: account %s: %s", label, uid, exc)
+                continue
+            fetched.pages[uid] = paths
+            log.info("session %s: account %s: %d page(s) saved", label, uid, len(paths))
+    return fetched
 
 
 @dataclass(frozen=True)
@@ -153,17 +207,29 @@ class StoreCounts:
     skipped: int = 0
 
 
-def store_from_disk(client: firefly.FireflyClient, session: dict, pages: dict[str, list[Path]]) -> StoreCounts:
-    """Map every saved transaction and store it in Firefly unless its external_id is there already."""
+def store_from_disk(
+    client: firefly.FireflyClient,
+    sessions: dict[str, dict],
+    pages: dict[str, list[Path]],
+    rules: list | None = None,
+) -> StoreCounts:
+    """Map every saved transaction and store it in Firefly unless its external_id is there already.
+
+    Every session account counts as imported, fetched this run or not, so the
+    side of a transfer between two banks is chosen the same way every run.
+    """
+    accounts = all_accounts(sessions)
     book = mapping.AccountBook.from_firefly(
-        client.accounts("asset"), imported_ibans=[account_iban(a) for a in session["accounts"]]
+        client.accounts("asset"), imported_ibans=[account_iban(a) for a in accounts], rules=rules or []
     )
     created = existing = skipped = 0
-    for account in session["accounts"]:
+    for account in accounts:
+        if account["uid"] not in pages:
+            continue
         own = book.get(account_iban(account))
         if own is None:
             raise mapping.MappingError(f"session account {account['uid']} has no Firefly asset account")
-        for path in pages.get(account["uid"], []):
+        for path in pages[account["uid"]]:
             for raw in json.loads(path.read_text()).get("transactions") or []:
                 payload = mapping.map_transaction(raw, own, book)
                 if payload is None:
@@ -192,10 +258,10 @@ def _retry_store(task, task_run, state) -> bool:
 
 # retries=0 is the default; spelled out because it's a constraint, not an oversight.
 @task(retries=0, cache_policy=NO_CACHE, persist_result=False)
-def fetch_pages(run_dir: Path, date_from: date, date_to: date) -> dict[str, list[Path]]:
-    session = load_session(session_path())
+def fetch_pages(run_dir: Path, date_from: date, date_to: date) -> Fetched:
+    sessions = load_sessions(sessions_dir())
     with enable_banking_client() as client:
-        return save_pages(client, session, run_dir, date_from, date_to)
+        return save_pages(client, sessions, run_dir, date_from, date_to)
 
 
 @task(
@@ -206,15 +272,12 @@ def fetch_pages(run_dir: Path, date_from: date, date_to: date) -> dict[str, list
     persist_result=False,
 )
 def store_pages(pages: dict[str, list[Path]]) -> StoreCounts:
-    session = load_session(session_path())
+    sessions = load_sessions(sessions_dir())
+    rules = mapping.load_rules(mapping_config())
     with firefly_client() as client:
-        counts = store_from_disk(client, session, pages)
+        counts = store_from_disk(client, sessions, pages, rules)
     log.info("stored %d new, %d already in Firefly, %d skipped", counts.created, counts.existing, counts.skipped)
     return counts
-
-
-def raw_root() -> Path:
-    return state_dir() / "raw"
 
 
 def prune_failed_runs(root: Path, now: float | None = None) -> None:
@@ -235,13 +298,23 @@ def run_id() -> str:
 @flow(name="transaction-import", persist_result=False)
 def import_flow(window_days: int = WINDOW_DAYS) -> None:
     """Fetch booked transactions from Enable Banking and write them to Firefly III."""
-    session = load_session(session_path())
-    metrics.push_consent_valid_until(consent_valid_until(session))
-    prune_failed_runs(raw_root())
+    write = firefly_write()
+    sessions = load_sessions(sessions_dir())
+    metrics.push_consent_valid_until({label: consent_valid_until(s) for label, s in sessions.items()})
+    if write:
+        prune_failed_runs(raw_root())
     today = datetime.now(UTC).date()
     run_dir = raw_root() / run_id()
-    pages = fetch_pages(run_dir, today - timedelta(days=window_days), today)
-    store_pages(pages)
-    # Stored, so Firefly has it all: don't keep a copy of the bank feed at rest.
-    shutil.rmtree(run_dir, ignore_errors=True)
-    metrics.push_success()
+    fetched = fetch_pages(run_dir, today - timedelta(days=window_days), today)
+    if not write:
+        log.warning("FIREFLY_WRITE is not true: saved raw pages to %s, stored nothing in Firefly", run_dir)
+    else:
+        store_pages(fetched.pages)
+    if len(fetched.errors) == 1:
+        raise fetched.errors[0]
+    if fetched.errors:
+        raise ExceptionGroup(f"{len(fetched.errors)} Enable Banking fetches failed", fetched.errors)
+    if write:
+        # Stored, so Firefly has it all: don't keep a copy of the bank feed at rest.
+        shutil.rmtree(run_dir, ignore_errors=True)
+        metrics.push_success()

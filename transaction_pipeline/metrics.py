@@ -19,14 +19,21 @@ logger = logging.getLogger(__name__)
 JOB = "transaction-pipeline"
 
 
-def push_consent_valid_until(valid_until: float) -> None:
-    """Push the session's `valid_until` (unix seconds). Every run that has a session pushes it."""
+def push_consent_valid_until(valid_until: dict[str, float]) -> None:
+    """Push each session's `valid_until` (unix seconds), labelled by session. Every run with a session pushes it.
+
+    All sessions go in one push, which replaces the metric in the group: a
+    session whose file was removed stops being reported.
+    """
     registry = CollectorRegistry()
-    Gauge(
+    gauge = Gauge(
         "transaction_pipeline_consent_valid_until_timestamp",
         "Unix timestamp at which the Enable Banking consent (session valid_until) expires",
+        ["session"],
         registry=registry,
-    ).set(valid_until)
+    )
+    for label, timestamp in valid_until.items():
+        gauge.labels(session=label).set(timestamp)
     _pushadd(registry)
 
 
