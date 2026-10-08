@@ -143,11 +143,23 @@ def consent_valid_until(session: dict) -> float:
     return datetime.fromisoformat(session["access"]["valid_until"]).timestamp()
 
 
-def account_iban(account: dict) -> str:
+def account_key(account: dict) -> tuple[str, str]:
+    """How a session account is matched to Firefly: ("iban", its IBAN), else ("number", its identification_hash).
+
+    Banks list some sub-accounts without an IBAN (N26 Spaces). Enable Banking's
+    identification_hash is the same for an account in every session, also one
+    authorised by another login, so it survives re-consent (the uid doesn't) and
+    a shared account seen through two logins has one key.
+    """
     iban = (account.get("account_id") or {}).get("iban")
-    if not iban:
-        raise mapping.MappingError(f"session account {account['uid']} has no IBAN, so it can't be matched to Firefly")
-    return iban
+    if iban:
+        return "iban", mapping.normalise_iban(iban)
+    if account.get("identification_hash"):
+        return "number", account["identification_hash"]
+    raise mapping.MappingError(
+        f"session account {account['uid']} has neither an IBAN nor an identification_hash, "
+        "so it can't be matched to Firefly"
+    )
 
 
 def all_accounts(sessions: dict[str, dict]) -> list[dict]:
@@ -259,16 +271,31 @@ def store_from_disk(
 
     Every session account counts as imported, fetched this run or not, so the
     side of a transfer between two banks is chosen the same way every run.
+
+    An account listed by several sessions (shared between two logins) is mapped
+    once, from the first session that has pages for it: the bank's references may
+    differ per login, so mapping both could store its bookings twice.
     """
     accounts = all_accounts(sessions)
+    keys = {account["uid"]: account_key(account) for account in accounts}
     book = mapping.AccountBook.from_firefly(
-        client.accounts("asset"), imported_ibans=[account_iban(a) for a in accounts], rules=rules or []
+        client.accounts("asset"),
+        imported_ibans=[value for kind, value in keys.values() if kind == "iban"],
+        rules=rules or [],
+        imported_numbers=[value for kind, value in keys.values() if kind == "number"],
     )
     created = existing = skipped = not_written = 0
+    mapped: dict[tuple[str, str], str] = {}
     for account in accounts:
         if account["uid"] not in pages:
             continue
-        own = book.get(account_iban(account))
+        key = keys[account["uid"]]
+        if key in mapped:
+            log.info("account %s is account %s under another session, mapped once", account["uid"], mapped[key])
+            continue
+        mapped[key] = account["uid"]
+        kind, value = key
+        own = book.get(value) if kind == "iban" else book.get_by_number(value)
         if own is None:
             raise mapping.MappingError(f"session account {account['uid']} has no Firefly asset account")
         for path in pages[account["uid"]]:

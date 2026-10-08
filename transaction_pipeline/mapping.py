@@ -9,8 +9,9 @@ POST /v1/transactions, ready for `FireflyClient.store_if_absent`.
 Used by the flow:
 
     rules = load_rules()                                     # MAPPING_CONFIG; [] when the file is absent
-    book = AccountBook.from_firefly(firefly.accounts("asset"), imported_ibans=[...], rules=rules)
-    own = book.get(session_account["account_id"]["iban"])   # this feed's account
+    book = AccountBook.from_firefly(firefly.accounts("asset"), imported_ibans=[...], rules=rules,
+                                    imported_numbers=[...])
+    own = book.get(iban) or book.get_by_number(identification_hash)  # this feed's account
     payload = map_transaction(raw_transaction, own, book)   # dict, or None to skip
 
 A counterparty is an own account, and the booking a transfer, when its IBAN is
@@ -35,7 +36,11 @@ carries the stranger's IBAN and can't pose as a sub-account move. Give `iban`
 for an intermediary whose IBAN does appear (the rule then needs that exact one).
 
 `imported_ibans` are the IBANs of the accounts this run fetches from Enable
-Banking. They decide which side of a transfer between own accounts is imported:
+Banking. Some banks list sub-accounts without an IBAN (N26 Spaces); those are
+keyed on Enable Banking's `identification_hash`, which is stable across
+sessions, and matched to the Firefly asset account whose account number is that
+hash: `imported_numbers`. Together they decide which side of a transfer between
+own accounts is imported:
 
 - A debit whose counterparty is an own account becomes one Firefly transfer.
 - The matching credit on the other account returns None when that account is
@@ -80,6 +85,8 @@ class OwnAccount:
     name: str
     iban: str | None
     imported: bool
+    # Firefly's account_number: an identification_hash for an account without an IBAN.
+    number: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,11 +136,12 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
 
 
 class AccountBook:
-    """Own Firefly accounts, found by normalised IBAN or by counterparty rule."""
+    """Own Firefly accounts, found by normalised IBAN, account number or counterparty rule."""
 
     def __init__(self, accounts: Iterable[OwnAccount], rules: Iterable[tuple[CounterpartyRule, OwnAccount]] = ()):
         accounts = list(accounts)
         self._by_iban = {a.iban: a for a in accounts if a.iban}
+        self._by_number = {a.number: a for a in accounts if a.number}
         self._rules = list(rules)
 
     @classmethod
@@ -142,16 +150,31 @@ class AccountBook:
         accounts: Iterable[dict],
         imported_ibans: Iterable[str],
         rules: Iterable[CounterpartyRule] = (),
+        imported_numbers: Iterable[str] = (),
     ) -> AccountBook:
-        """Build from Firefly `data` items (FireflyClient.accounts) and the rules from `load_rules`."""
+        """Build from Firefly `data` items (FireflyClient.accounts) and the rules from `load_rules`.
+
+        An imported account is matched by IBAN, or by account number for one without an IBAN.
+        """
         imported = {normalise_iban(i) for i in imported_ibans}
+        imported_numbers = {n.strip() for n in imported_numbers}
         own = []
         for item in accounts:
             iban = normalise_iban(item["attributes"].get("iban") or "") or None
-            own.append(OwnAccount(item["id"], item["attributes"]["name"], iban, iban in imported))
-        missing = imported - {a.iban for a in own}
-        if missing:
-            raise MappingError(f"{len(missing)} imported account(s) have no Firefly account with that IBAN")
+            number = (item["attributes"].get("account_number") or "").strip() or None
+            own.append(OwnAccount(
+                item["id"], item["attributes"]["name"], iban,
+                iban in imported or number in imported_numbers, number,
+            ))
+        missing_ibans = imported - {a.iban for a in own}
+        missing_numbers = imported_numbers - {a.number for a in own}
+        if missing_ibans:
+            raise MappingError(f"{len(missing_ibans)} imported account(s) have no Firefly account with that IBAN")
+        if missing_numbers:
+            raise MappingError(
+                f"{len(missing_numbers)} imported account(s) without an IBAN have no Firefly account with their "
+                "identification_hash as its account number"
+            )
         by_name = {a.name: a for a in own}
         resolved = []
         for rule in rules:
@@ -162,6 +185,9 @@ class AccountBook:
 
     def get(self, iban: str | None) -> OwnAccount | None:
         return self._by_iban.get(normalise_iban(iban or ""))
+
+    def get_by_number(self, number: str | None) -> OwnAccount | None:
+        return self._by_number.get((number or "").strip())
 
     def own_counterparty(
         self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str

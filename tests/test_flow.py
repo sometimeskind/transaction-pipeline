@@ -209,8 +209,9 @@ def fake_mapping(monkeypatch):
     ])
     calls = {"mapped": [], "imported": None, "rules": None}
 
-    def from_firefly(cls, accounts, imported_ibans, rules=()):
+    def from_firefly(cls, accounts, imported_ibans, rules=(), imported_numbers=()):
         calls["imported"], calls["rules"] = list(imported_ibans), rules
+        calls["imported_numbers"] = list(imported_numbers)
         return book
 
     def map_transaction(raw, account, book):
@@ -283,10 +284,72 @@ def test_a_missing_saved_run_is_refused(tmp_path):
         flow.saved_pages(tmp_path / "run-1", SESSIONS)
 
 
-def test_a_session_account_without_iban_fails():
+def test_a_session_account_with_neither_iban_nor_identification_hash_fails():
     sessions = {"bank-one": {**SESSIONS["bank-one"], "accounts": [{"uid": UID_A, "account_id": {}}]}}
-    with pytest.raises(mapping.MappingError, match="no IBAN"):
+    with pytest.raises(mapping.MappingError, match="neither an IBAN nor an identification_hash"):
         flow.store_from_disk(FakeFirefly(), sessions, {})
+
+
+def test_an_account_shared_by_two_sessions_is_mapped_once(tmp_path, fake_mapping):
+    shared = {"uid": UID_C, "account_id": {"iban": IBAN_A}, "currency": "EUR"}
+    sessions = {**SESSIONS, "bank-two": {**SESSIONS["bank-two"], "accounts": [shared]}}
+    fetched = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [tx("a1")]}], **empty(UID_B), UID_C: [{"transactions": [tx("c1")]}]}),
+        sessions, tmp_path, FROM, TO,
+    )
+    flow.store_from_disk(FakeFirefly(), sessions, fetched.pages)
+    assert fake_mapping["mapped"] == [("a1", IBAN_A)]
+
+
+def test_a_shared_account_is_mapped_from_the_other_session_when_one_fetch_failed(tmp_path, fake_mapping):
+    shared = {"uid": UID_C, "account_id": {"iban": IBAN_A}, "currency": "EUR"}
+    sessions = {**SESSIONS, "bank-two": {**SESSIONS["bank-two"], "accounts": [shared]}}
+    pages = {UID_C: [flow.write_json(tmp_path / UID_C / "page-1.json", {"transactions": [tx("c1")]})]}
+    flow.store_from_disk(FakeFirefly(), sessions, pages)
+    assert fake_mapping["mapped"] == [("c1", IBAN_A)]
+
+
+SPACE_HASH = "synthetic-identification-hash-" + "0" * 100
+UID_SPACE = "00000000-0000-4000-8000-00000000005a"
+UID_SPACE_TOO = "00000000-0000-4000-8000-00000000005b"
+
+
+class SpaceFirefly(FakeFirefly):
+    """Firefly with named asset accounts, one of them a sub-account keyed by account number."""
+
+    def accounts(self, account_type="asset"):
+        return [{"id": str(i), "attributes": {"iban": iban, "name": f"Synthetic {i}"}}
+                for i, iban in enumerate((IBAN_A, IBAN_B, IBAN_C))] + [
+            {"id": "9", "attributes": {"iban": None, "account_number": SPACE_HASH, "name": "Synthetic space"}}]
+
+
+def space(uid: str) -> dict:
+    return {"uid": uid, "account_id": {"iban": None}, "identification_hash": SPACE_HASH, "currency": "EUR"}
+
+
+def test_an_account_without_iban_is_matched_by_identification_hash(tmp_path):
+    sessions = {"bank-one": {**SESSIONS["bank-one"], "accounts": [*SESSIONS["bank-one"]["accounts"], space(UID_SPACE)]}}
+    fetched = flow.save_pages(FakeBank({UID_SPACE: [{"transactions": [tx("s1")]}], **empty(UID_A, UID_B)}),
+                              sessions, tmp_path, FROM, TO)
+    firefly = SpaceFirefly()
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=1)
+    [split] = firefly.stored[0]["transactions"]
+    assert (split["external_id"], split["type"], split["source_id"]) == ("s1", "withdrawal", "9")
+
+
+def test_the_same_identification_hash_in_two_sessions_is_mapped_once(tmp_path):
+    sessions = {
+        "bank-one": {**SESSIONS["bank-one"], "accounts": [space(UID_SPACE)]},
+        "bank-two": {**SESSIONS["bank-two"], "accounts": [space(UID_SPACE_TOO)]},
+    }
+    # The bank may give each login its own references for the same booking.
+    fetched = flow.save_pages(
+        FakeBank({UID_SPACE: [{"transactions": [tx("s1")]}], UID_SPACE_TOO: [{"transactions": [tx("other-s1")]}]}),
+        sessions, tmp_path, FROM, TO,
+    )
+    firefly = SpaceFirefly()
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=1)
+    assert [p["transactions"][0]["external_id"] for p in firefly.stored] == ["s1"]
 
 
 @pytest.mark.parametrize(

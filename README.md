@@ -111,16 +111,28 @@ Prefect review in homelab#1983):
 
 `mapping.py` turns one raw Enable Banking transaction into one Firefly
 transaction: a withdrawal, a deposit, or a transfer when the other side is an own
-account. Own accounts are found in two ways:
+account. Own accounts are found in three ways:
 
 - **By IBAN:** any Firefly asset account with its IBAN set. A transfer between
   two imported accounts is created once, from its debit side.
+- **By account number, for an account without an IBAN:** some banks list
+  sub-accounts (N26 Spaces) as accounts of their own with no IBAN. These are
+  matched by Enable Banking's `identification_hash`, which stays the same across
+  re-consent and across logins. To set one up, create a Firefly asset account
+  for it and put the account's `identification_hash` (from the session file
+  under `STATE_DIR/sessions/`) in its **account number**, leaving the IBAN
+  empty. A run fails while an imported account has no Firefly account with its
+  IBAN or hash.
 - **By rule:** for own accounts that bookings don't name by IBAN, such as
   sub-accounts or a payment service in the middle. Rules live in a TOML file at
   `MAPPING_CONFIG` (default `/config/mapping.toml`). The file is optional, and no
   file means no rules. The deployment mounts it from a secret, because the real
   rules describe our accounts and never go in this repo. The format is in the
   `mapping.py` docstring.
+
+An account that two logins share (a shared Space, a joint account) is listed by
+both sessions under different uids, and is mapped once per run, from the first
+session that fetched it.
 
 `firefly.py` stores each transaction only when no transaction with its
 `external_id` exists, and never updates an existing one.
