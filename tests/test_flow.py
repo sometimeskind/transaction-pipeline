@@ -1,8 +1,12 @@
 """Flow tests. All fixtures are synthetic, written from the Enable Banking API schema."""
 
+import contextlib
 import json
 import os
+import subprocess
+import sys
 from datetime import date
+from pathlib import Path
 
 import httpx
 import pytest
@@ -585,3 +589,79 @@ def test_store_runs_through_the_real_mapping(tmp_path):
     [split] = firefly.stored[0]["transactions"]
     assert (split["external_id"], split["type"], split["source_id"]) == (
         keys("iban", IBAN_A, tx("a1"))[0], "withdrawal", "0")
+
+
+def test_each_account_logs_its_pages_transaction_count_and_booking_dates(tmp_path, caplog):
+    bank = FakeBank({
+        UID_A: [{"transactions": [{**tx("a1"), "booking_date": "2026-01-05"}], "continuation_key": "k1"},
+                {"transactions": [tx("a2"), {**tx("a3"), "booking_date": "2026-01-03"}]}],
+        UID_B: [{"transactions": [{**tx("b1"), "booking_date": None}]}],
+        **empty(UID_C),
+    })
+    with caplog.at_level("INFO", logger="transaction_pipeline.flow"):
+        flow.save_pages(bank, SESSIONS, tmp_path, FROM, TO)
+
+    assert caplog.messages == [
+        f"session bank-one: account {UID_A}: 2 page(s) saved, 3 transaction(s) booked 2026-01-02 to 2026-01-05",
+        f"session bank-one: account {UID_B}: 1 page(s) saved, 1 transaction(s) (1 without a booking_date)",
+        f"session bank-two: account {UID_C}: 1 page(s) saved, 0 transaction(s)",
+    ]
+
+
+def test_store_logs_its_counts_per_account_and_in_total(state, monkeypatch, fake_mapping, caplog):
+    pages = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [tx("a1"), tx("skip1")]}], UID_B: [{"transactions": [tx("b1")]}],
+                  **empty(UID_C)}),
+        SESSIONS, state / "raw" / "run-1", FROM, TO,
+    ).pages
+    firefly = FakeFirefly(existing=set(keys("iban", IBAN_B, tx("b1"))))
+    monkeypatch.setattr(flow, "firefly_client", lambda: contextlib.nullcontext(firefly))
+    monkeypatch.setenv("MAPPING_CONFIG", str(state / "no-such-mapping.toml"))
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="transaction_pipeline.flow"):
+        flow.store_pages.fn(pages)
+
+    assert caplog.messages == [
+        f"account {UID_A}: 1 created, 0 existing, 1 skipped, 0 not written",
+        f"account {UID_B}: 0 created, 1 existing, 0 skipped, 0 not written",
+        f"account {UID_C}: 0 created, 0 existing, 0 skipped, 0 not written",
+        "all accounts: 1 created, 1 existing, 1 skipped, 0 not written",
+    ]
+
+
+def test_a_map_only_store_logs_what_it_did_not_write(state, monkeypatch, fake_mapping, caplog):
+    pages = flow.save_pages(FakeBank({UID_A: [{"transactions": [tx("a1"), tx("skip1")]}], **empty(UID_B, UID_C)}),
+                            SESSIONS, state / "raw" / "run-1", FROM, TO).pages
+    monkeypatch.setattr(flow, "firefly_client", lambda: contextlib.nullcontext(FakeFirefly()))
+    monkeypatch.setenv("MAPPING_CONFIG", str(state / "no-such-mapping.toml"))
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="transaction_pipeline.flow"):
+        flow.store_pages.fn(pages, write=False)
+
+    assert caplog.messages[0] == f"account {UID_A}: 0 created, 0 existing, 1 skipped, 1 not written"
+    assert caplog.messages[-1] == "all accounts: 0 created, 0 existing, 1 skipped, 1 not written"
+
+
+def test_the_flow_logs_info_to_the_prefect_run_log():
+    """With PREFECT_LOGGING_EXTRA_LOGGERS (set in the image), the flow logger gets Prefect's API handler."""
+    check = (
+        "import logging\n"
+        "from prefect.logging.configuration import setup_logging\n"
+        "from prefect.logging.handlers import APILogHandler\n"
+        "from transaction_pipeline import flow\n"
+        "setup_logging()\n"
+        "assert flow.log.isEnabledFor(logging.INFO)\n"
+        "assert any(isinstance(h, APILogHandler) for h in flow.log.handlers)\n"
+        "assert not logging.getLogger('transaction_pipeline.mapping').isEnabledFor(logging.INFO)\n"
+    )
+    env = {**os.environ, "PREFECT_LOGGING_EXTRA_LOGGERS": "transaction_pipeline.flow"}
+    subprocess.run([sys.executable, "-c", check], env=env, check=True)
+
+
+def test_the_image_sends_the_flow_logger_to_prefect():
+    dockerfile = Path(__file__).parents[1] / "Dockerfile"
+    if not dockerfile.exists():
+        pytest.skip("runs from the repo, not inside the image")
+    assert "ENV PREFECT_LOGGING_EXTRA_LOGGERS=transaction_pipeline.flow\n" in dockerfile.read_text()

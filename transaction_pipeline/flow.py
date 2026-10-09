@@ -64,6 +64,11 @@ from transaction_pipeline.enable_banking import (
 )
 
 log = logging.getLogger(__name__)
+# Prefect's logging config leaves the root logger at WARNING. The image sets
+# PREFECT_LOGGING_EXTRA_LOGGERS to this module, which gives it Prefect's API
+# handler; at INFO its lines then reach the run log, and the pod log through
+# the root console handler. Only this module: mapping.py logs per transaction.
+log.setLevel(logging.INFO)
 
 # Days back from today. Firefly dedupes the overlap, and the request count is
 # the same whatever the window, so a missed run or two needs no backfill.
@@ -200,9 +205,11 @@ def save_pages(
         for account in session["accounts"]:
             uid = account["uid"]
             paths: list[Path] = []
+            booking_dates: list[str] = []
             try:
                 for n, page in enumerate(client.transaction_pages(uid, date_from, date_to), start=1):
                     paths.append(write_json(run_dir / uid / f"page-{n}.json", page))
+                    booking_dates += [raw.get("booking_date") or "" for raw in page.get("transactions") or []]
             except SessionGoneError as exc:
                 fetched.errors.append(ConsentNeededError(
                     f"session {label}: Enable Banking session is gone ({exc.error_code}): "
@@ -223,8 +230,19 @@ def save_pages(
                 log.error("session %s: account %s: %s", label, uid, exc)
                 continue
             fetched.pages[uid] = paths
-            log.info("session %s: account %s: %d page(s) saved", label, uid, len(paths))
+            log.info("session %s: account %s: %d page(s) saved, %s", label, uid, len(paths), fetch_summary(booking_dates))
     return fetched
+
+
+def fetch_summary(booking_dates: list[str]) -> str:
+    """Transaction count and booking-date range: what an account's fetch got, without its content."""
+    dates = sorted(d for d in booking_dates if d)
+    summary = f"{len(booking_dates)} transaction(s)"
+    if dates:
+        summary += f" booked {dates[0]} to {dates[-1]}"
+    if len(dates) < len(booking_dates):
+        summary += f" ({len(booking_dates) - len(dates)} without a booking_date)"
+    return summary
 
 
 def saved_pages(run_dir: Path, sessions: dict[str, dict]) -> dict[str, list[Path]]:
@@ -264,6 +282,17 @@ class StoreCounts:
     # Mapped but not stored, because FIREFLY_WRITE is off (replay only).
     not_written: int = 0
 
+    def __add__(self, other: StoreCounts) -> StoreCounts:
+        return StoreCounts(
+            self.created + other.created,
+            self.existing + other.existing,
+            self.skipped + other.skipped,
+            self.not_written + other.not_written,
+        )
+
+    def __str__(self) -> str:
+        return f"{self.created} created, {self.existing} existing, {self.skipped} skipped, {self.not_written} not written"
+
 
 def store_from_disk(
     client: firefly.FireflyClient,
@@ -291,7 +320,7 @@ def store_from_disk(
         rules=rules or [],
         imported_numbers=[value for kind, value in keys.values() if kind == "number"],
     )
-    created = existing = skipped = not_written = 0
+    total = StoreCounts()
     mapped: dict[tuple[str, str], str] = {}
     for account in accounts:
         if account["uid"] not in pages:
@@ -306,6 +335,7 @@ def store_from_disk(
         if own is None:
             raise mapping.MappingError(f"session account {account['uid']} has no Firefly asset account")
         transactions = load_transactions(pages[account["uid"]])
+        created = existing = skipped = not_written = 0
         for raw, external_id in zip(transactions, mapping.external_ids(key, transactions), strict=True):
             payload = mapping.map_transaction(raw, own, book, external_id)
             if payload is None:
@@ -316,7 +346,10 @@ def store_from_disk(
                 created += 1
             else:
                 existing += 1
-    return StoreCounts(created, existing, skipped, not_written)
+        counts = StoreCounts(created, existing, skipped, not_written)
+        log.info("account %s: %s", account["uid"], counts)
+        total += counts
+    return total
 
 
 def is_transient(exc: BaseException) -> bool:
@@ -354,10 +387,7 @@ def store_pages(pages: dict[str, list[Path]], write: bool = True) -> StoreCounts
     rules = mapping.load_rules(mapping_config())
     with firefly_client() as client:
         counts = store_from_disk(client, sessions, pages, rules, write=write)
-    log.info(
-        "stored %d new, %d already in Firefly, %d skipped, %d mapped but not written",
-        counts.created, counts.existing, counts.skipped, counts.not_written,
-    )
+    log.info("all accounts: %s", counts)
     return counts
 
 
