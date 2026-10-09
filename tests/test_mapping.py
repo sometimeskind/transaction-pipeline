@@ -210,6 +210,29 @@ def test_account_book_fails_when_an_imported_account_is_not_in_firefly():
         AccountBook.from_firefly([], imported_ibans=[CHECKING.iban])
 
 
+SPACE_HASH = "synthetic-identification-hash-" + "0" * 100
+
+
+def test_account_book_matches_an_account_without_iban_by_account_number():
+    accounts = [
+        {"id": "1", "attributes": {"name": "Synthetic checking", "iban": CHECKING.iban}},
+        {"id": "6", "attributes": {"name": "Synthetic space", "iban": None, "account_number": SPACE_HASH}},
+        {"id": "7", "attributes": {"name": "Synthetic other space", "iban": None, "account_number": "other"}},
+    ]
+
+    book = AccountBook.from_firefly(accounts, imported_ibans=[CHECKING.iban], imported_numbers=[SPACE_HASH])
+
+    assert book.get_by_number(SPACE_HASH) == OwnAccount("6", "Synthetic space", None, True, SPACE_HASH)
+    assert book.get_by_number("other").imported is False
+    assert book.get_by_number(None) is None
+
+
+def test_account_book_fails_when_an_imported_account_number_is_not_in_firefly():
+    accounts = [{"id": "6", "attributes": {"name": "Synthetic space", "iban": None, "account_number": "other"}}]
+    with pytest.raises(MappingError, match="identification_hash as its account number"):
+        AccountBook.from_firefly(accounts, imported_ibans=[], imported_numbers=[SPACE_HASH])
+
+
 POT = OwnAccount("5", "Synthetic pot", None, imported=False)
 POT_RULE = CounterpartyRule("Synthetic pot", name=re.compile("^synthetic pot$", re.IGNORECASE))
 RULE_BOOK = AccountBook([CHECKING, SAVINGS, POT], [(POT_RULE, POT)])
