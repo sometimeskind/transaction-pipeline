@@ -12,7 +12,8 @@ Used by the flow:
     book = AccountBook.from_firefly(firefly.accounts("asset"), imported_ibans=[...], rules=rules,
                                     imported_numbers=[...])
     own = book.get(iban) or book.get_by_number(identification_hash)  # this feed's account
-    payload = map_transaction(raw_transaction, own, book)   # dict, or None to skip
+    ids = external_ids(account_key, raw_transactions)         # one per booking, all of the run's pages
+    payload = map_transaction(raw_transaction, own, book, ids[i])  # dict, or None to skip
 
 A counterparty is an own account, and the booking a transfer, when its IBAN is
 on a Firefly asset account, or else when it matches a rule from the rules file.
@@ -48,30 +49,43 @@ own accounts is imported:
   account is only in Firefly (not fetched), the credit is the only side we ever
   see, so it becomes the transfer.
 
-The Firefly `external_id`, the idempotency key, is the `entry_reference`, or the
-`transaction_id` when the bank sends no `entry_reference`.
+The Firefly `external_id`, the idempotency key, is derived from the booking's
+content by `external_ids`: `tp1:` and a SHA-256 hex digest of the account key
+(IBAN, else identification_hash), booking_date, amount, currency, direction, and
+the booking's ordinal among the bookings with those same fields on that account
+and day, counted across all of the run's pages in the order they list them.
+Only fields that can't change once a booking is final go in; counterparty and
+remittance text, value_date and bank codes stay out. The bank's references
+don't go in either: N26 sends no `entry_reference` for most bookings, and a
+booking fetched once with one and once without would get two keys. The
+`entry_reference`, when there is one, goes into the Firefly `internal_reference`.
 
 `map_transaction` also returns None for a zero amount, which Firefly rejects.
-Anything it can't map safely (neither `entry_reference` nor `transaction_id`, no
-booking date, no direction) raises `MappingError`, so the flow fails rather than
-guessing.
+Anything it can't key or map safely (no booking date, no amount, no direction)
+raises `MappingError`, so the flow fails rather than guessing.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
 import tomllib
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 DEFAULT_RULES_PATH = "/config/mapping.toml"
 DESCRIPTION_MAX = 1000
+# Bump when the content key changes, so keys of the old scheme are recognisable.
+KEY_VERSION = "tp1"
 NO_DESCRIPTION = "(no description)"
 
 
@@ -212,17 +226,52 @@ def normalise_iban(iban: str) -> str:
     return "".join(iban.split()).upper()
 
 
-def map_transaction(raw: dict, account: OwnAccount, book: AccountBook) -> dict | None:
-    """The Firefly store payload for `raw`, booked on `account`; None to skip it (see module docstring)."""
-    external_id = raw.get("entry_reference") or raw.get("transaction_id")
-    if not external_id:
-        raise MappingError(
-            "transaction has neither entry_reference nor transaction_id, so it can't be stored idempotently"
-        )
-    booking_date = raw.get("booking_date") or raw.get("value_date")
-    if not booking_date:
-        raise MappingError(f"transaction {external_id} has no booking_date or value_date")
+def external_ids(account_key: tuple[str, str], transactions: Iterable[dict]) -> list[str]:
+    """The content key of each raw transaction, in order (see module docstring).
 
+    `transactions` are all of one account's bookings in a run, in page order:
+    the ordinal counts across pages, so a page boundary can't change a key.
+    `account_key` is ("iban", IBAN) or ("number", identification_hash).
+    """
+    seen: Counter[tuple] = Counter()
+    keys = []
+    for raw in transactions:
+        fields = _key_fields(raw)
+        seen[fields] += 1
+        content = json.dumps([*account_key, *fields, seen[fields]], separators=(",", ":"))
+        keys.append(f"{KEY_VERSION}:{hashlib.sha256(content.encode()).hexdigest()}")
+    return keys
+
+
+def booking_day(raw: dict) -> date:
+    """The booking_date; a booking without one can't be keyed."""
+    try:
+        return date.fromisoformat(raw["booking_date"])
+    except (KeyError, TypeError, ValueError):
+        raise MappingError("transaction has no valid booking_date, so it can't be keyed") from None
+
+
+def _key_fields(raw: dict) -> tuple[str, str, str, str]:
+    """(booking_date, unsigned amount, currency, "DBIT"/"CRDT"), normalised so formatting can't change a key."""
+    day = booking_day(raw)
+    money = raw.get("transaction_amount") or {}
+    try:
+        amount = Decimal(money["amount"])
+    except (KeyError, TypeError, InvalidOperation):
+        raise MappingError(f"transaction booked {day} has no valid amount, so it can't be keyed") from None
+    currency = (money.get("currency") or "").strip().upper()
+    if not currency:
+        raise MappingError(f"transaction booked {day} has no currency, so it can't be keyed")
+    direction = "DBIT" if _is_debit(raw.get("credit_debit_indicator"), amount, f"booked {day}") else "CRDT"
+    return day.isoformat(), format(abs(amount).normalize(), "f"), currency, direction
+
+
+def map_transaction(raw: dict, account: OwnAccount, book: AccountBook, external_id: str) -> dict | None:
+    """The Firefly store payload for `raw`, booked on `account`; None to skip it (see module docstring).
+
+    `external_id` is the booking's key from `external_ids`.
+    """
+    booking_date = booking_day(raw).isoformat()
     money = raw["transaction_amount"]
     amount = Decimal(money["amount"])
     debit = _is_debit(raw.get("credit_debit_indicator"), amount, external_id)
@@ -247,6 +296,9 @@ def map_transaction(raw: dict, account: OwnAccount, book: AccountBook) -> dict |
         "description": _description(raw, party_name),
         "external_id": external_id,
     }
+    if raw.get("entry_reference"):
+        # For tracing a booking back to the bank, never for idempotency.
+        split["internal_reference"] = raw["entry_reference"]
     split.update(_foreign(raw, money["currency"]))
 
     if other_own is not None:
@@ -270,7 +322,7 @@ def map_transaction(raw: dict, account: OwnAccount, book: AccountBook) -> dict |
     }
 
 
-def _is_debit(indicator: str | None, amount: Decimal, external_id: str) -> bool:
+def _is_debit(indicator: str | None, amount: Decimal, which: str) -> bool:
     if indicator == "DBIT":
         return True
     if indicator == "CRDT":
@@ -278,7 +330,7 @@ def _is_debit(indicator: str | None, amount: Decimal, external_id: str) -> bool:
     # Without an indicator, only a signed amount says which way the money went.
     if amount < 0:
         return True
-    raise MappingError(f"transaction {external_id} has no credit_debit_indicator and an unsigned amount")
+    raise MappingError(f"transaction {which} has no credit_debit_indicator and an unsigned amount")
 
 
 def _account_identifiers(account: dict | None) -> tuple[str | None, str | None]:

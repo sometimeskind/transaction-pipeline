@@ -47,6 +47,10 @@ def tx(ref: str) -> dict:
     }
 
 
+def keys(kind: str, value: str, *raws: dict) -> list[str]:
+    return mapping.external_ids((kind, value), list(raws))
+
+
 def empty(*uids):
     return {uid: [{"transactions": []}] for uid in uids}
 
@@ -214,11 +218,11 @@ def fake_mapping(monkeypatch):
         calls["imported_numbers"] = list(imported_numbers)
         return book
 
-    def map_transaction(raw, account, book):
+    def map_transaction(raw, account, book, external_id):
         calls["mapped"].append((raw["entry_reference"], account.iban))
         if raw["entry_reference"].startswith("skip"):
             return None
-        return {"transactions": [{"external_id": raw["entry_reference"]}]}
+        return {"transactions": [{"external_id": external_id}]}
 
     monkeypatch.setattr(mapping.AccountBook, "from_firefly", classmethod(from_firefly))
     monkeypatch.setattr(mapping, "map_transaction", map_transaction)
@@ -231,14 +235,15 @@ def test_store_maps_from_the_pages_on_disk(tmp_path, fake_mapping):
                   UID_C: [{"transactions": [tx("c1")]}]}),
         SESSIONS, tmp_path, FROM, TO,
     )
-    firefly = FakeFirefly(existing={"b1"})
+    firefly = FakeFirefly(existing=set(keys("iban", IBAN_B, tx("b1"))))
 
     counts = flow.store_from_disk(firefly, SESSIONS, fetched.pages, rules=["rule"])
 
     assert counts == flow.StoreCounts(created=2, existing=1, skipped=1)
     assert fake_mapping["mapped"] == [("a1", IBAN_A), ("skip1", IBAN_A), ("b1", IBAN_B), ("c1", IBAN_C)]
     assert fake_mapping["rules"] == ["rule"]
-    assert [p["transactions"][0]["external_id"] for p in firefly.stored] == ["a1", "c1"]
+    assert [p["transactions"][0]["external_id"] for p in firefly.stored] == [
+        keys("iban", IBAN_A, tx("a1"))[0], keys("iban", IBAN_C, tx("c1"))[0]]
 
 
 def test_every_session_account_counts_as_imported_even_when_its_fetch_failed(tmp_path, fake_mapping):
@@ -305,8 +310,11 @@ def test_a_shared_account_is_mapped_from_the_other_session_when_one_fetch_failed
     shared = {"uid": UID_C, "account_id": {"iban": IBAN_A}, "currency": "EUR"}
     sessions = {**SESSIONS, "bank-two": {**SESSIONS["bank-two"], "accounts": [shared]}}
     pages = {UID_C: [flow.write_json(tmp_path / UID_C / "page-1.json", {"transactions": [tx("c1")]})]}
-    flow.store_from_disk(FakeFirefly(), sessions, pages)
+    firefly = FakeFirefly()
+    flow.store_from_disk(firefly, sessions, pages)
     assert fake_mapping["mapped"] == [("c1", IBAN_A)]
+    # The same keys as from the first session: they hash the IBAN, not the uid.
+    assert [p["transactions"][0]["external_id"] for p in firefly.stored] == keys("iban", IBAN_A, tx("a1"))
 
 
 SPACE_HASH = "synthetic-identification-hash-" + "0" * 100
@@ -334,7 +342,8 @@ def test_an_account_without_iban_is_matched_by_identification_hash(tmp_path):
     firefly = SpaceFirefly()
     assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=1)
     [split] = firefly.stored[0]["transactions"]
-    assert (split["external_id"], split["type"], split["source_id"]) == ("s1", "withdrawal", "9")
+    assert (split["external_id"], split["type"], split["source_id"]) == (
+        keys("number", SPACE_HASH, tx("s1"))[0], "withdrawal", "9")
 
 
 def test_the_same_identification_hash_in_two_sessions_is_mapped_once(tmp_path):
@@ -349,7 +358,51 @@ def test_the_same_identification_hash_in_two_sessions_is_mapped_once(tmp_path):
     )
     firefly = SpaceFirefly()
     assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=1)
-    assert [p["transactions"][0]["external_id"] for p in firefly.stored] == ["s1"]
+    assert [p["transactions"][0]["external_id"] for p in firefly.stored] == keys("number", SPACE_HASH, tx("s1"))
+    # Fetched under the other login only (the first one's fetch failed), it is the same booking.
+    only_too = {UID_SPACE_TOO: fetched.pages[UID_SPACE_TOO]}
+    assert flow.store_from_disk(firefly, sessions, only_too) == flow.StoreCounts(existing=1)
+
+
+def space_sessions() -> dict:
+    return {"bank-one": {**SESSIONS["bank-one"], "accounts": [space(UID_SPACE)]}}
+
+
+def store_run(tmp_path, firefly, run: str, pages: list[list[dict]]) -> flow.StoreCounts:
+    fetched = flow.save_pages(FakeBank({UID_SPACE: [{"transactions": p} for p in pages]}),
+                              space_sessions(), tmp_path / run, FROM, TO)
+    return flow.store_from_disk(firefly, space_sessions(), fetched.pages)
+
+
+def booking(ref: str | None = None, day: str = "2026-01-02", amount: str = "12.34") -> dict:
+    return {**tx(ref), "booking_date": day, "transaction_amount": {"amount": amount, "currency": "EUR"}}
+
+
+def test_identical_same_day_bookings_are_all_stored(tmp_path):
+    firefly = SpaceFirefly()
+    assert store_run(tmp_path, firefly, "run-1", [[booking(), booking(), booking()]]) == flow.StoreCounts(created=3)
+    assert len({p["transactions"][0]["external_id"] for p in firefly.stored}) == 3
+
+
+def test_a_booking_fetched_with_and_without_entry_reference_is_stored_once(tmp_path):
+    firefly = SpaceFirefly()
+    store_run(tmp_path, firefly, "run-1", [[booking(None), booking(None, amount="5.00")]])
+    assert store_run(tmp_path, firefly, "run-2", [[booking("ref-1"), booking("ref-2", amount="5.00")]]) == (
+        flow.StoreCounts(existing=2))
+
+
+def test_the_same_bookings_split_over_other_pages_or_reordered_store_nothing_new(tmp_path):
+    same_day = [booking(), booking(amount="5.00"), booking(), booking(day="2026-01-03")]
+    firefly = SpaceFirefly()
+    store_run(tmp_path, firefly, "run-1", [same_day])
+    assert store_run(tmp_path, firefly, "run-2", [same_day[:1], same_day[1:]]) == flow.StoreCounts(existing=4)
+    assert store_run(tmp_path, firefly, "run-3", [same_day[::-1]]) == flow.StoreCounts(existing=4)
+
+
+def test_a_new_identical_booking_later_in_the_day_is_stored(tmp_path):
+    firefly = SpaceFirefly()
+    store_run(tmp_path, firefly, "run-1", [[booking()]])
+    assert store_run(tmp_path, firefly, "run-2", [[booking(), booking()]]) == flow.StoreCounts(created=1, existing=1)
 
 
 @pytest.mark.parametrize(
@@ -359,7 +412,7 @@ def test_the_same_identification_hash_in_two_sessions_is_mapped_once(tmp_path):
         (FireflyError(503, "down"), True),
         (FireflyError(422, "invalid"), False),
         (ExternalIdConflictError("reused"), False),
-        (mapping.MappingError("no entry_reference"), False),
+        (mapping.MappingError("no booking_date"), False),
     ],
 )
 def test_only_transient_firefly_errors_are_retried(exc, retry):
@@ -530,4 +583,5 @@ def test_store_runs_through_the_real_mapping(tmp_path):
     rules = mapping.load_rules(tmp_path / "no-such-mapping.toml")
     assert flow.store_from_disk(firefly, SESSIONS, fetched.pages, rules) == flow.StoreCounts(created=1)
     [split] = firefly.stored[0]["transactions"]
-    assert (split["external_id"], split["type"], split["source_id"]) == ("a1", "withdrawal", "0")
+    assert (split["external_id"], split["type"], split["source_id"]) == (
+        keys("iban", IBAN_A, tx("a1"))[0], "withdrawal", "0")

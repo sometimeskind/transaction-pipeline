@@ -1,4 +1,4 @@
-"""`python -m transaction_pipeline [serve | consent ...]`.
+"""`python -m transaction_pipeline [serve | consent ... | compare-keys ...]`.
 
 `serve` (also the default, so the image's bare CMD keeps working) runs the Prefect
 deployment, scheduled by FETCH_CRON (unset: registered without a schedule).
@@ -10,6 +10,10 @@ expired:
 It prints the bank's URL, the operator approves in the bank and pastes back the URL
 the browser lands on, and the session goes to STATE_DIR/sessions/LABEL.json. No
 web UI, and no reseal per consent.
+
+`compare-keys RUN_A RUN_B` compares the content keys of two saved runs (see
+compare.py) and prints counts per account, never transaction content. It exits
+1 when any account has keys in only one of the runs.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from typing import TextIO
 
-from transaction_pipeline import flow
+from transaction_pipeline import compare, flow
 from transaction_pipeline.enable_banking import (
     ConsentRedirectError,
     EnableBankingClient,
@@ -60,6 +64,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     consent.add_argument("--country", required=True, help="bank's two-letter country code")
     consent.add_argument("--redirect-url", required=True, help="a redirect URL registered on the Enable Banking app")
     consent.add_argument("--psu-type", default="personal", choices=["personal", "business"])
+    compare_keys = commands.add_parser(
+        "compare-keys", help="compare two saved runs' booking keys for the days both cover; prints counts only"
+    )
+    compare_keys.add_argument("run_a", help="run id: a directory under STATE_DIR/raw")
+    compare_keys.add_argument("run_b", help="run id: a directory under STATE_DIR/raw")
     return parser.parse_args(argv)
 
 
@@ -114,6 +123,13 @@ def run_consent(
     return session
 
 
+def run_compare_keys(args: argparse.Namespace, stdout: TextIO) -> int:
+    results = compare.compare_runs(args.run_a, args.run_b, flow.load_sessions(flow.sessions_dir()))
+    for result in results:
+        print(result.line(), file=stdout)
+    return 1 if any(r.only_a or r.only_b for r in results) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     # Everything this process writes to the state dir is personal financial data.
@@ -125,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("transaction-import schedule: %s", cron or "none (FETCH_CRON unset)")
         flow.import_flow.serve(name="transaction-import", cron=cron)
         return 0
+    if args.command == "compare-keys":
+        return run_compare_keys(args, sys.stdout)
     try:
         with flow.enable_banking_client() as client:
             run_consent(client, args, sys.stdin, sys.stdout)
