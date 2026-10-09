@@ -9,8 +9,9 @@ Prefect schedules and runs it, and is never the source of truth (homelab#1981):
 - Every raw page is written to STATE_DIR/raw/<flow-run-id>/<account-uid>/page-<n>.json
   before anything is mapped, and the store step reads the pages back from disk. So
   the store step can retry without touching the bank.
-- Idempotency lives in Firefly (entry_reference → external_id). The window
-  overlaps the previous runs on purpose: a failed run is covered by the next one.
+- Idempotency lives in Firefly: external_id is a key derived from each booking's
+  content (mapping.external_ids). The window overlaps the previous runs on
+  purpose: a failed run is covered by the next one.
 
 Everything under STATE_DIR is personal financial data (the session reads every
 consented account; raw pages carry IBANs, counterparties and amounts). So files
@@ -250,6 +251,11 @@ def saved_pages(run_dir: Path, sessions: dict[str, dict]) -> dict[str, list[Path
     return pages
 
 
+def load_transactions(paths: list[Path]) -> list[dict]:
+    """One account's transactions from its saved pages, in page order."""
+    return [raw for path in paths for raw in json.loads(path.read_text()).get("transactions") or []]
+
+
 @dataclass(frozen=True)
 class StoreCounts:
     created: int = 0
@@ -273,8 +279,9 @@ def store_from_disk(
     side of a transfer between two banks is chosen the same way every run.
 
     An account listed by several sessions (shared between two logins) is mapped
-    once, from the first session that has pages for it: the bank's references may
-    differ per login, so mapping both could store its bookings twice.
+    once, from the first session that has pages for it. Its keys are the same
+    under every session (they hash the account key, not the uid), so mapping it
+    twice would only look up every booking twice.
     """
     accounts = all_accounts(sessions)
     keys = {account["uid"]: account_key(account) for account in accounts}
@@ -298,17 +305,17 @@ def store_from_disk(
         own = book.get(value) if kind == "iban" else book.get_by_number(value)
         if own is None:
             raise mapping.MappingError(f"session account {account['uid']} has no Firefly asset account")
-        for path in pages[account["uid"]]:
-            for raw in json.loads(path.read_text()).get("transactions") or []:
-                payload = mapping.map_transaction(raw, own, book)
-                if payload is None:
-                    skipped += 1
-                elif not write:
-                    not_written += 1
-                elif client.store_if_absent(payload).created:
-                    created += 1
-                else:
-                    existing += 1
+        transactions = load_transactions(pages[account["uid"]])
+        for raw, external_id in zip(transactions, mapping.external_ids(key, transactions), strict=True):
+            payload = mapping.map_transaction(raw, own, book, external_id)
+            if payload is None:
+                skipped += 1
+            elif not write:
+                not_written += 1
+            elif client.store_if_absent(payload).created:
+                created += 1
+            else:
+                existing += 1
     return StoreCounts(created, existing, skipped, not_written)
 
 
