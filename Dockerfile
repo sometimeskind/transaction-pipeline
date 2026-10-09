@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir -r /build/requirements.txt /build
 
 RUN mkdir -p /state /config /secrets
 
+# The flow's INFO lines (per-account fetch and store counts) go to the Prefect run log.
+ENV PREFECT_LOGGING_EXTRA_LOGGERS=transaction_pipeline.flow
+
 CMD ["python", "-m", "transaction_pipeline"]
 
 FROM prod AS dev
