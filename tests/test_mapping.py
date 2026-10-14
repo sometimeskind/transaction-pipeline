@@ -6,12 +6,16 @@ import pytest
 
 from transaction_pipeline.mapping import (
     AccountBook,
+    Booking,
     CounterpartyRule,
     MappingError,
     OwnAccount,
+    UnpairedMoveError,
     external_ids,
+    is_internal_move,
     load_rules,
     map_transaction,
+    pair_internal_moves,
 )
 
 CHECKING = OwnAccount("1", "Synthetic checking", "XX00SYNTHETIC0000000001", imported=True)
@@ -432,3 +436,176 @@ def test_rule_with_iban_needs_that_iban():
 
     assert _split(map_transaction(hit, CHECKING, book, KEY))["type"] == "transfer"
     assert _split(map_transaction(miss, CHECKING, book, KEY))["type"] == "withdrawal"
+
+
+SPACE = OwnAccount("6", "Synthetic space", None, imported=True, number="hash-6")
+OTHER_SPACE = OwnAccount("7", "Synthetic other space", None, imported=True, number="hash-7")
+MOVE_BOOK = AccountBook([CHECKING, SAVINGS, SPACE, OTHER_SPACE])
+
+
+def _move(direction: str = "DBIT", text: str | None = "Synthetic sorter", amount: str = "10.00",
+          day: str = "2026-01-02", **overrides) -> dict:
+    """A SEPA credit transfer whose counterparty shows no account, as some banks book moves between own accounts."""
+    raw = {
+        "transaction_amount": {"currency": "EUR", "amount": amount},
+        "credit_debit_indicator": direction,
+        "status": "BOOK",
+        "booking_date": day,
+        "bank_transaction_code": {"code": "ICDT" if direction == "DBIT" else "RCDT", "sub_code": "ESCT"},
+        "remittance_information": [text] if text else [],
+    }
+    raw.update(overrides)
+    return raw
+
+
+def _bookings(*items: tuple[OwnAccount, dict]) -> list[Booking]:
+    return [Booking(account, raw, f"tp1:{i:064d}") for i, (account, raw) in enumerate(items)]
+
+
+def _pairs(bookings: list[Booking]) -> dict[str, str]:
+    pairing = pair_internal_moves(bookings)
+    return {b.external_id[-1]: pairing.partner[b.external_id].name for b in bookings if b.external_id in pairing.partner}
+
+
+@pytest.mark.parametrize(
+    ("raw", "internal"),
+    [
+        (_move(), True),
+        (_move("CRDT", debtor={"name": "Someone"}), True),
+        (_move(creditor_account={"iban": GROCER_IBAN}), False),
+        (_move(creditor_account={"other": {"identification": "12345"}}), False),
+        (_move(bank_transaction_code={"code": "CCRD", "sub_code": "POSD"}), False),
+        (_move(bank_transaction_code=None), False),
+    ],
+)
+def test_an_internal_move_is_a_sepa_credit_transfer_naming_no_account(raw, internal):
+    assert is_internal_move(raw) is internal
+
+
+def test_a_move_pairs_with_the_opposite_booking_on_another_account():
+    bookings = _bookings((CHECKING, _move("DBIT")), (SPACE, _move("CRDT")))
+
+    assert _pairs(bookings) == {"0": "Synthetic space", "1": "Synthetic checking"}
+    assert pair_internal_moves(bookings).unpaired == []
+
+
+def test_a_side_without_text_pairs_with_a_side_with_text():
+    bookings = _bookings((SPACE, _move("DBIT", text=None)), (CHECKING, _move("CRDT", text="From space to checking")))
+
+    assert _pairs(bookings) == {"0": "Synthetic checking", "1": "Synthetic space"}
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        _move("CRDT", text="something else"),
+        _move("CRDT", amount="10.01"),
+        _move("CRDT", day="2026-01-03"),
+        _move("DBIT"),
+        _move("CRDT", transaction_amount={"currency": "GBP", "amount": "10.00"}),
+    ],
+)
+def test_a_move_does_not_pair_with_other_text_amount_day_direction_or_currency(other):
+    bookings = _bookings((CHECKING, _move("DBIT")), (SPACE, other))
+
+    assert _pairs(bookings) == {}
+    assert len(pair_internal_moves(bookings).unpaired) == 2
+
+
+def test_a_move_does_not_pair_with_its_own_account():
+    assert _pairs(_bookings((SPACE, _move("DBIT")), (SPACE, _move("CRDT")))) == {}
+
+
+def test_interchangeable_bookings_on_one_account_pair_with_several_accounts():
+    # An income split: identical debits on one account, a credit on each space.
+    bookings = _bookings(
+        (CHECKING, _move("DBIT")), (CHECKING, _move("DBIT")),
+        (SPACE, _move("CRDT")), (OTHER_SPACE, _move("CRDT")),
+    )
+
+    pairs = _pairs(bookings)
+
+    assert {pairs["0"], pairs["1"]} == {"Synthetic space", "Synthetic other space"}
+    assert pairs["2"] == pairs["3"] == "Synthetic checking"
+
+
+def test_a_choice_between_accounts_leaves_the_bookings_unpaired():
+    bookings = _bookings((CHECKING, _move("DBIT")), (SPACE, _move("CRDT")), (OTHER_SPACE, _move("CRDT")))
+
+    pairing = pair_internal_moves(bookings)
+
+    assert pairing.partner == {}
+    assert len(pairing.unpaired) == 3
+
+
+def test_the_same_bookings_in_another_order_pair_the_same_way():
+    bookings = _bookings(
+        (CHECKING, _move("DBIT")), (CHECKING, _move("DBIT")),
+        (SPACE, _move("CRDT")), (OTHER_SPACE, _move("CRDT")),
+    )
+
+    assert pair_internal_moves(bookings).partner == pair_internal_moves(bookings[::-1]).partner
+
+
+def test_a_paired_debit_is_a_transfer_and_its_credit_is_skipped():
+    debit = map_transaction(_move("DBIT"), CHECKING, MOVE_BOOK, KEY, paired=SPACE)
+
+    assert _split(debit)["type"] == "transfer"
+    assert (_split(debit)["source_id"], _split(debit)["destination_id"]) == ("1", "6")
+    assert map_transaction(_move("CRDT"), SPACE, MOVE_BOOK, KEY, paired=CHECKING) is None
+
+
+def test_an_unpaired_internal_move_without_a_name_is_never_booked_against_cash():
+    with pytest.raises(UnpairedMoveError, match="no other side"):
+        map_transaction(_move("CRDT"), SPACE, MOVE_BOOK, KEY)
+
+
+def test_an_unpaired_internal_move_with_a_name_is_mapped_as_usual():
+    raw = _move("DBIT", creditor={"name": "Example Friend"})
+
+    assert _split(map_transaction(raw, CHECKING, MOVE_BOOK, KEY))["destination_name"] == "Example Friend"
+
+
+ROUND_UP_RULE = CounterpartyRule(
+    "Synthetic checking", remittance=re.compile("^round-up$", re.IGNORECASE),
+    booked_on="Synthetic space", other_side_missing=True,
+)
+ROUND_UP_BOOK = AccountBook([CHECKING, SPACE, OTHER_SPACE], [(ROUND_UP_RULE, CHECKING)])
+
+
+def test_a_one_sided_rule_makes_the_credit_the_transfer():
+    split = _split(map_transaction(_move("CRDT", text="Round-up"), SPACE, ROUND_UP_BOOK, KEY))
+
+    assert split["type"] == "transfer"
+    assert (split["source_id"], split["destination_id"]) == ("1", "6")
+
+
+def test_a_rule_booked_on_one_account_ignores_the_others():
+    with pytest.raises(UnpairedMoveError):
+        map_transaction(_move("CRDT", text="Round-up"), OTHER_SPACE, ROUND_UP_BOOK, KEY)
+
+
+def test_a_pair_wins_over_a_rule():
+    raw = _move("CRDT", text="Round-up")
+
+    assert map_transaction(raw, SPACE, ROUND_UP_BOOK, KEY, paired=OTHER_SPACE) is None
+
+
+def test_load_rules_reads_booked_on_and_other_side_missing(tmp_path):
+    path = tmp_path / "rules.toml"
+    path.write_text(
+        '[[own_counterparty]]\naccount = "Synthetic checking"\nremittance = "^Round-up$"\n'
+        'booked_on = "Synthetic space"\nother_side_missing = true\n'
+    )
+
+    [rule] = load_rules(path)
+
+    assert (rule.booked_on, rule.other_side_missing) == ("Synthetic space", True)
+
+
+def test_a_rule_booked_on_a_missing_firefly_account_fails():
+    rule = CounterpartyRule("Synthetic checking", remittance=re.compile("x"), booked_on="No such account")
+    accounts = [{"id": "1", "attributes": {"name": "Synthetic checking", "iban": CHECKING.iban}}]
+
+    with pytest.raises(MappingError, match="No such account"):
+        AccountBook.from_firefly(accounts, [CHECKING.iban], rules=[rule])

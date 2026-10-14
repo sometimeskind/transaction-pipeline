@@ -13,10 +13,12 @@ Used by the flow:
                                     imported_numbers=[...])
     own = book.get(iban) or book.get_by_number(identification_hash)  # this feed's account
     ids = external_ids(account_key, raw_transactions)         # one per booking, all of the run's pages
-    payload = map_transaction(raw_transaction, own, book, ids[i])  # dict, or None to skip
+    pairing = pair_internal_moves(bookings)                   # Booking(own, raw, id) of every account
+    payload = map_transaction(raw_transaction, own, book, ids[i], pairing.partner.get(ids[i]))
 
 A counterparty is an own account, and the booking a transfer, when its IBAN is
-on a Firefly asset account, or else when it matches a rule from the rules file.
+on a Firefly asset account, else when the booking pairs with an internal move on
+another imported account (below), or else when it matches a rule from the rules file.
 Rules cover own accounts that bookings don't name by IBAN, such as sub-accounts
 inside a bank account or a payment service in the middle of a transfer. The
 file is TOML at `MAPPING_CONFIG` (default /config/mapping.toml), optional: no
@@ -35,6 +37,23 @@ name and remittance text, so a rule without `iban` only applies when the
 counterparty shows no IBAN or the booking account's own: a stranger's payment
 carries the stranger's IBAN and can't pose as a sub-account move. Give `iban`
 for an intermediary whose IBAN does appear (the rule then needs that exact one).
+
+Two optional rule keys cover moves the bank shows on one side only:
+
+    booked_on = "Round-up pot"        # only bookings on this Firefly account
+    other_side_missing = true         # the credit is the transfer: no debit ever appears
+
+Some banks book a move between two own accounts as a SEPA credit transfer
+(`ICDT/ESCT` out, `RCDT/ESCT` in) whose counterparty has no IBAN or account
+number, often not even a name, on both sides (N26 Spaces). Such an internal move
+is identified by its other side, not its text: `pair_internal_moves` pairs an
+outgoing and an incoming one on two accounts with the same booking_date, amount
+and currency, and the same remittance text or none on one side. Where several
+bookings could pair, it pairs only when no choice between accounts is involved:
+the side being chosen from is all on one account, so its bookings are
+interchangeable. An internal move without a counterparty name that neither
+pairs nor matches a rule raises `UnpairedMoveError` instead of being booked
+against the cash account; one with a name is mapped as usual.
 
 `imported_ibans` are the IBANs of the accounts this run fetches from Enable
 Banking. Some banks list sub-accounts without an IBAN (N26 Spaces); those are
@@ -73,9 +92,9 @@ import logging
 import os
 import re
 import tomllib
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -91,6 +110,10 @@ NO_DESCRIPTION = "(no description)"
 
 class MappingError(Exception):
     """The raw transaction can't be mapped without guessing."""
+
+
+class UnpairedMoveError(MappingError):
+    """An internal move without a counterparty name matched no other booking and no rule."""
 
 
 @dataclass(frozen=True)
@@ -111,6 +134,10 @@ class CounterpartyRule:
     name: re.Pattern | None = None
     remittance: re.Pattern | None = None
     iban: str | None = None
+    # Firefly name of the only account whose bookings the rule applies to.
+    booked_on: str | None = None
+    # The other side never shows in the bank data, so a matching credit is the transfer.
+    other_side_missing: bool = False
 
     def matches(self, party_name: str | None, remittance: str) -> bool:
         if self.name is not None and not self.name.search(party_name or ""):
@@ -132,7 +159,7 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
         return []
     rules = []
     for i, entry in enumerate(tomllib.loads(path.read_text()).get("own_counterparty", [])):
-        unknown = set(entry) - {"account", "name", "remittance", "iban"}
+        unknown = set(entry) - {"account", "name", "remittance", "iban", "booked_on", "other_side_missing"}
         if unknown or "account" not in entry or not ({"name", "remittance"} & set(entry)):
             raise MappingError(
                 f"{path}: own_counterparty[{i}] needs account plus name and/or remittance"
@@ -144,6 +171,8 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
                 name=re.compile(entry["name"], re.IGNORECASE) if "name" in entry else None,
                 remittance=re.compile(entry["remittance"], re.IGNORECASE) if "remittance" in entry else None,
                 iban=normalise_iban(entry["iban"]) if "iban" in entry else None,
+                booked_on=entry.get("booked_on"),
+                other_side_missing=entry.get("other_side_missing") is True,
             )
         )
     return rules
@@ -192,8 +221,9 @@ class AccountBook:
         by_name = {a.name: a for a in own}
         resolved = []
         for rule in rules:
-            if rule.account not in by_name:
-                raise MappingError(f"rule names Firefly account {rule.account!r}, which doesn't exist")
+            for name in (rule.account, rule.booked_on):
+                if name is not None and name not in by_name:
+                    raise MappingError(f"rule names Firefly account {name!r}, which doesn't exist")
             resolved.append((rule, by_name[rule.account]))
         return cls(own, resolved)
 
@@ -214,11 +244,20 @@ class AccountBook:
         by_iban = self.get(party_iban)
         if by_iban is not None and by_iban != account:
             return by_iban
+        found = self.rule_for(account, party_name, party_iban, remittance)
+        return found[1] if found else None
+
+    def rule_for(
+        self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str
+    ) -> tuple[CounterpartyRule, OwnAccount] | None:
+        """The first rule matching a booking on `account`, with the own account it names."""
         party_iban = normalise_iban(party_iban or "") or None
         for rule, own in self._rules:
             expected = {rule.iban} if rule.iban else {None, account.iban}
+            if rule.booked_on is not None and rule.booked_on != account.name:
+                continue
             if own != account and party_iban in expected and rule.matches(party_name, remittance):
-                return own
+                return rule, own
         return None
 
 
@@ -266,10 +305,98 @@ def _key_fields(raw: dict) -> tuple[str, str, str, str]:
     return day.isoformat(), format(abs(amount).normalize(), "f"), currency, direction
 
 
-def map_transaction(raw: dict, account: OwnAccount, book: AccountBook, external_id: str) -> dict | None:
+INTERNAL_MOVE_CODES = {("ICDT", "ESCT"), ("RCDT", "ESCT")}
+
+
+def is_internal_move(raw: dict) -> bool:
+    """A SEPA credit transfer whose counterparty shows no account: possibly a move between own accounts."""
+    code = raw.get("bank_transaction_code") or {}
+    if (code.get("code"), code.get("sub_code")) not in INTERNAL_MOVE_CODES:
+        return False
+    _, party_account = _party(raw, _key_fields(raw)[3] == "DBIT")
+    return _account_identifiers(party_account) == (None, None)
+
+
+@dataclass(frozen=True, eq=False)
+class Booking:
+    """A raw transaction on an own account, with its key from `external_ids`."""
+
+    account: OwnAccount
+    raw: dict
+    external_id: str
+
+
+@dataclass
+class Pairing:
+    # external_id of a paired booking -> the own account on its other side
+    partner: dict[str, OwnAccount] = field(default_factory=dict)
+    # Internal moves that pair with nothing
+    unpaired: list[Booking] = field(default_factory=list)
+
+
+def pair_internal_moves(bookings: Iterable[Booking]) -> Pairing:
+    """Pair the internal moves among `bookings`, every imported account's (see module docstring).
+
+    Bookings with the same remittance text are paired first, then what is left
+    with bookings that have no text. The result depends only on the bookings, not
+    their order, so the same pages always give the same transfers.
+    """
+    groups: defaultdict[tuple, tuple[list[Booking], list[Booking]]] = defaultdict(lambda: ([], []))
+    for b in bookings:
+        if is_internal_move(b.raw):
+            day, amount, currency, direction = _key_fields(b.raw)
+            groups[(day, amount, currency)][direction == "CRDT"].append(b)
+    pairing = Pairing()
+    for debits, credits in groups.values():
+        left_d: list[Booking] = []
+        left_c: list[Booking] = []
+        for text in sorted({_remittance(b.raw) for b in debits + credits} - {""}):
+            d, c = _pair(pairing, [b for b in debits if _remittance(b.raw) == text],
+                         [b for b in credits if _remittance(b.raw) == text])
+            left_d += d
+            left_c += c
+        bare_d = [b for b in debits if not _remittance(b.raw)]
+        bare_c = [b for b in credits if not _remittance(b.raw)]
+        left_d, bare_c = _pair(pairing, left_d, bare_c)
+        bare_d, left_c = _pair(pairing, bare_d, left_c)
+        bare_d, bare_c = _pair(pairing, bare_d, bare_c)
+        pairing.unpaired += left_d + left_c + bare_d + bare_c
+    return pairing
+
+
+def _pair(pairing: Pairing, debits: list[Booking], credits: list[Booking]) -> tuple[list[Booking], list[Booking]]:
+    """Pair what can be paired without choosing between accounts; return what is left of each side.
+
+    One side must be all on one account, so its bookings are interchangeable,
+    and either have enough bookings for every booking of the other side or the
+    other side must be all on one account too.
+    """
+    debits = sorted(debits, key=lambda b: b.external_id)
+    credits = sorted(credits, key=lambda b: b.external_id)
+    for chosen, choosing in ((debits, credits), (credits, debits)):
+        accounts = {b.account for b in chosen}
+        if len(accounts) != 1:
+            continue
+        others = [b for b in choosing if b.account not in accounts]
+        if len(chosen) < len(others) and len({b.account for b in others}) > 1:
+            continue
+        n = min(len(chosen), len(others))
+        for a, b in zip(chosen[:n], others[:n], strict=True):
+            pairing.partner[a.external_id] = b.account
+            pairing.partner[b.external_id] = a.account
+        taken = set(others[:n])
+        rest_chosen, rest_choosing = chosen[n:], [b for b in choosing if b not in taken]
+        return (rest_chosen, rest_choosing) if chosen is debits else (rest_choosing, rest_chosen)
+    return debits, credits
+
+
+def map_transaction(
+    raw: dict, account: OwnAccount, book: AccountBook, external_id: str, paired: OwnAccount | None = None
+) -> dict | None:
     """The Firefly store payload for `raw`, booked on `account`; None to skip it (see module docstring).
 
-    `external_id` is the booking's key from `external_ids`.
+    `external_id` is the booking's key from `external_ids`; `paired` is the own
+    account on the other side when `pair_internal_moves` paired the booking.
     """
     booking_date = booking_day(raw).isoformat()
     money = raw["transaction_amount"]
@@ -280,14 +407,22 @@ def map_transaction(raw: dict, account: OwnAccount, book: AccountBook, external_
         log.info("skipping %s: zero amount", external_id)
         return None
 
-    party, party_account = (
-        (raw.get("creditor"), raw.get("creditor_account"))
-        if debit
-        else (raw.get("debtor"), raw.get("debtor_account"))
-    )
+    party, party_account = _party(raw, debit)
     party_name = ((party or {}).get("name") or "").strip() or None
     party_iban, party_number = _account_identifiers(party_account)
-    other_own = book.own_counterparty(account, party_name, party_iban, _remittance(raw))
+    other_own = book.get(party_iban)
+    one_sided = False
+    if other_own == account:
+        other_own = None
+    if other_own is None:
+        other_own = paired
+    if other_own is None:
+        found = book.rule_for(account, party_name, party_iban, _remittance(raw))
+        if found is not None:
+            rule, other_own = found
+            one_sided = rule.other_side_missing
+    if other_own is None and party_name is None and is_internal_move(raw):
+        raise UnpairedMoveError(f"{external_id}: internal move booked {booking_date} has no other side")
 
     split: dict = {
         "date": booking_date,
@@ -302,7 +437,7 @@ def map_transaction(raw: dict, account: OwnAccount, book: AccountBook, external_
     split.update(_foreign(raw, money["currency"]))
 
     if other_own is not None:
-        if not debit and other_own.imported:
+        if not debit and other_own.imported and not one_sided:
             log.info("skipping %s: credit side of a transfer from %s, imported from its debit side", external_id, other_own.name)
             return None
         source, destination = (account, other_own) if debit else (other_own, account)
@@ -320,6 +455,13 @@ def map_transaction(raw: dict, account: OwnAccount, book: AccountBook, external_
         "fire_webhooks": True,
         "transactions": [split],
     }
+
+
+def _party(raw: dict, debit: bool) -> tuple[dict | None, dict | None]:
+    """The counterparty and its account: the creditor of a debit, the debtor of a credit."""
+    if debit:
+        return raw.get("creditor"), raw.get("creditor_account")
+    return raw.get("debtor"), raw.get("debtor_account")
 
 
 def _is_debit(indicator: str | None, amount: Decimal, which: str) -> bool:

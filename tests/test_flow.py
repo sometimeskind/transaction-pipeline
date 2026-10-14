@@ -99,7 +99,7 @@ def test_nothing_is_persisted_to_prefect_result_storage():
 
 def test_tasks_take_no_session_or_transaction_data():
     assert set(flow.fetch_pages.fn.__annotations__) - {"return"} == {"run_dir", "date_from", "date_to"}
-    assert set(flow.store_pages.fn.__annotations__) - {"return"} == {"pages", "write"}
+    assert set(flow.store_pages.fn.__annotations__) - {"return"} == {"pages", "write", "since"}
 
 
 def test_sessions_live_one_file_per_label(state):
@@ -222,7 +222,7 @@ def fake_mapping(monkeypatch):
         calls["imported_numbers"] = list(imported_numbers)
         return book
 
-    def map_transaction(raw, account, book, external_id):
+    def map_transaction(raw, account, book, external_id, paired=None):
         calls["mapped"].append((raw["entry_reference"], account.iban))
         if raw["entry_reference"].startswith("skip"):
             return None
@@ -469,8 +469,9 @@ class FlowHarness:
         monkeypatch.setattr(metrics, "push_consent_valid_until", lambda v: self.events.append(("consent", v)))
         monkeypatch.setattr(metrics, "push_success", lambda: self.events.append("success"))
 
-    def store_pages(self, pages, write=True):
-        self.events.append(("store", sorted(pages)) if write else ("map-only", sorted(pages)))
+    def store_pages(self, pages, write=True, since=None):
+        uids = sorted(pages) if isinstance(pages, dict) else [sorted(run) for run in pages]
+        self.events.append(("store" if write else "map-only", uids, *([since] if since else [])))
 
     def run(self, **params):
         import_flow.fn(**params)
@@ -554,7 +555,7 @@ def test_replay_stores_a_saved_run_without_fetching_or_pruning_then_deletes_it(s
     monkeypatch.setenv("FIREFLY_WRITE", "true")
     harness = FlowHarness(monkeypatch)
     harness.run(replay_run="backfill")
-    assert harness.events == [CONSENT, ("store", [UID_A, UID_C])]
+    assert harness.events == [CONSENT, ("store", [[UID_A, UID_C]])]
     assert harness.run_dir is None
     assert not saved_run.exists()
 
@@ -563,7 +564,7 @@ def test_replay_without_write_maps_only(saved_run, monkeypatch):
     monkeypatch.delenv("FIREFLY_WRITE", raising=False)
     harness = FlowHarness(monkeypatch)
     harness.run(replay_run="backfill")
-    assert harness.events == [CONSENT, ("map-only", [UID_A, UID_C])]
+    assert harness.events == [CONSENT, ("map-only", [[UID_A, UID_C]])]
     assert (saved_run / UID_A / "page-1.json").exists()
 
 
@@ -665,3 +666,126 @@ def test_the_image_sends_the_flow_logger_to_prefect():
     if not dockerfile.exists():
         pytest.skip("runs from the repo, not inside the image")
     assert "ENV PREFECT_LOGGING_EXTRA_LOGGERS=transaction_pipeline.flow\n" in dockerfile.read_text()
+
+
+def move(direction: str, text: str | None = "Synthetic sorter", day: str = "2026-01-02") -> dict:
+    """An internal move: a SEPA credit transfer whose counterparty shows no account."""
+    return {
+        "booking_date": day,
+        "transaction_amount": {"amount": "10.00", "currency": "EUR"},
+        "credit_debit_indicator": direction,
+        "bank_transaction_code": {"code": "ICDT" if direction == "DBIT" else "RCDT", "sub_code": "ESCT"},
+        "remittance_information": [text] if text else [],
+    }
+
+
+# A booking on a later day, so the moves' day isn't the latest one in the pages.
+LATER = {**tx("later"), "booking_date": "2026-01-05"}
+
+
+def move_sessions() -> dict:
+    """Two logins: an account and a space on one, an account on the other."""
+    return {
+        "bank-one": {**SESSIONS["bank-one"], "accounts": [SESSIONS["bank-one"]["accounts"][0], space(UID_SPACE)]},
+        "bank-two": SESSIONS["bank-two"],
+    }
+
+
+def test_a_move_pairs_across_two_sessions_into_one_transfer(tmp_path):
+    sessions = move_sessions()
+    fetched = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [LATER]}], UID_SPACE: [{"transactions": [move("DBIT")]}],
+                  UID_C: [{"transactions": [move("CRDT", text=None)]}]}),
+        sessions, tmp_path, FROM, TO,
+    )
+    firefly = SpaceFirefly()
+
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=2, skipped=1)
+    [split] = [p["transactions"][0] for p in firefly.stored if p["transactions"][0]["type"] == "transfer"]
+    assert (split["source_id"], split["destination_id"]) == ("9", "2")
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(existing=2, skipped=1)
+
+
+def test_internal_moves_on_the_latest_day_wait_for_the_next_run(tmp_path):
+    sessions = move_sessions()
+    fetched = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [tx("a1")]}], UID_SPACE: [{"transactions": [move("DBIT")]}],
+                  UID_C: [{"transactions": [move("CRDT")]}]}),
+        sessions, tmp_path, FROM, TO,
+    )
+    assert flow.store_from_disk(SpaceFirefly(), sessions, fetched.pages) == flow.StoreCounts(created=1, deferred=2)
+
+
+def test_internal_moves_wait_for_a_run_where_every_account_has_pages(tmp_path):
+    sessions = move_sessions()
+    fetched = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [tx("a1")]}], UID_SPACE: [{"transactions": [move("DBIT")]}],
+                  UID_C: [RateLimitedError(429, "ASPSP_RATE_LIMIT_EXCEEDED", None)]}),
+        sessions, tmp_path, FROM, TO,
+    )
+    firefly = SpaceFirefly()
+
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=1, deferred=1)
+    assert [p["transactions"][0]["type"] for p in firefly.stored] == ["withdrawal"]
+
+
+def test_an_unpaired_move_fails_the_store_after_storing_the_rest(tmp_path, caplog):
+    sessions = move_sessions()
+    fetched = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [LATER]}], UID_SPACE: [{"transactions": [move("CRDT")]}],
+                  **empty(UID_C)}),
+        sessions, tmp_path, FROM, TO,
+    )
+    firefly = SpaceFirefly()
+
+    with caplog.at_level("INFO", logger="transaction_pipeline.flow"), pytest.raises(
+            mapping.UnpairedMoveError, match="1 internal move"):
+        flow.store_from_disk(firefly, sessions, fetched.pages)
+    assert len(firefly.stored) == 1
+    assert f"account {UID_SPACE}: 0 created, 0 existing, 0 skipped, 0 not written, 1 unpaired" in caplog.messages
+
+
+def test_several_runs_are_mapped_as_one_union_of_their_bookings(tmp_path):
+    sessions = move_sessions()
+    # Overlapping runs: the day they share is the same bookings, so the same keys.
+    run_1 = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [booking(day="2026-01-01"), booking(day="2026-01-02")]}],
+                  UID_SPACE: [{"transactions": [move("DBIT", day="2026-01-02")]}], **empty(UID_C)}),
+        sessions, tmp_path / "run-1", FROM, TO,
+    ).pages
+    run_2 = flow.save_pages(
+        FakeBank({UID_A: [{"transactions": [booking(day="2026-01-02"), booking(day="2026-01-03")]}],
+                  **empty(UID_SPACE), UID_C: [{"transactions": [move("CRDT", day="2026-01-02")]}]}),
+        sessions, tmp_path / "run-2", FROM, TO,
+    ).pages
+    firefly = SpaceFirefly()
+
+    counts = flow.store_from_disk(firefly, sessions, [run_1, run_2], since=date(2026, 1, 2))
+
+    assert counts == flow.StoreCounts(created=3, skipped=1)
+    assert sorted(p["transactions"][0]["date"] for p in firefly.stored) == ["2026-01-02", "2026-01-02", "2026-01-03"]
+
+
+def test_replay_maps_several_saved_runs_together(saved_run, monkeypatch):
+    flow.write_json(saved_run.parent / "daily" / UID_A / "page-1.json", {"transactions": []})
+    monkeypatch.setenv("FIREFLY_WRITE", "true")
+    harness = FlowHarness(monkeypatch)
+    harness.run(replay_run=["backfill", "daily"], since=date(2026, 1, 2))
+    assert harness.events == [CONSENT, ("store", [[UID_A, UID_C], [UID_A]], date(2026, 1, 2))]
+    assert not saved_run.exists()
+    assert not (saved_run.parent / "daily").exists()
+
+
+@pytest.mark.parametrize("runs", [[], ["backfill", "../sessions"]])
+def test_replay_refuses_an_empty_list_or_any_bad_run_id(saved_run, monkeypatch, runs):
+    harness = FlowHarness(monkeypatch)
+    with pytest.raises(ValueError):
+        harness.run(replay_run=runs)
+    assert saved_run.exists()
+
+
+def test_since_without_a_replay_is_refused(state, monkeypatch):
+    harness = FlowHarness(monkeypatch)
+    with pytest.raises(ValueError, match="since"):
+        harness.run(since=date(2026, 1, 2))
+    assert harness.events == []
