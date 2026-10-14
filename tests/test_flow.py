@@ -8,6 +8,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import cloudpickle
 import httpx
 import pytest
 
@@ -84,6 +85,19 @@ def state(monkeypatch, tmp_path):
 
 def test_flow_is_registered_under_its_deployment_name():
     assert import_flow.name == "transaction-import"
+
+
+def test_deployment_parameters_validate_after_pickling_by_value():
+    # A served run gets the flow pickled by value (prefect.bundles), which drops globals
+    # used only in annotations; .fn() in the other tests skips validation altogether.
+    cloudpickle.register_pickle_by_value(flow)
+    try:
+        pickled = cloudpickle.loads(cloudpickle.dumps(import_flow))
+    finally:
+        cloudpickle.unregister_pickle_by_value(flow)
+    params = pickled.validate_parameters({"replay_run": ["run-a", "run-b"], "since": "2023-10-13"})
+    assert params["since"] == "2023-10-13"
+    assert params["replay_run"] == ["run-a", "run-b"]
 
 
 def test_fetch_has_no_retries_and_store_retries():
@@ -770,7 +784,7 @@ def test_replay_maps_several_saved_runs_together(saved_run, monkeypatch):
     flow.write_json(saved_run.parent / "daily" / UID_A / "page-1.json", {"transactions": []})
     monkeypatch.setenv("FIREFLY_WRITE", "true")
     harness = FlowHarness(monkeypatch)
-    harness.run(replay_run=["backfill", "daily"], since=date(2026, 1, 2))
+    harness.run(replay_run=["backfill", "daily"], since="2026-01-02")
     assert harness.events == [CONSENT, ("store", [[UID_A, UID_C], [UID_A]], date(2026, 1, 2))]
     assert not saved_run.exists()
     assert not (saved_run.parent / "daily").exists()
@@ -787,5 +801,5 @@ def test_replay_refuses_an_empty_list_or_any_bad_run_id(saved_run, monkeypatch, 
 def test_since_without_a_replay_is_refused(state, monkeypatch):
     harness = FlowHarness(monkeypatch)
     with pytest.raises(ValueError, match="since"):
-        harness.run(since=date(2026, 1, 2))
+        harness.run(since="2026-01-02")
     assert harness.events == []

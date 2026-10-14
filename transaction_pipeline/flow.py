@@ -473,20 +473,24 @@ def run_id() -> str:
 
 @flow(name="transaction-import", persist_result=False)
 def import_flow(
-    window_days: int = WINDOW_DAYS, replay_run: str | list[str] | None = None, since: date | None = None
+    window_days: int = WINDOW_DAYS, replay_run: str | list[str] | None = None, since: str | None = None
 ) -> None:
     """Fetch booked transactions from Enable Banking and write them to Firefly III.
 
     With `replay_run` (one run id or a list), map and store those saved runs'
-    pages together instead of fetching, leaving out bookings before `since`.
+    pages together instead of fetching, leaving out bookings before `since`
+    (an ISO date). It is a string, not a `date`: Prefect pickles this module by
+    value for a served run, which loses names used only in annotations, so a
+    `date` parameter fails validation before the flow starts.
     """
     if since is not None and replay_run is None:
         raise ValueError("since only applies to a replay_run")
+    since_date = date.fromisoformat(since) if since is not None else None
     write = firefly_write()
     sessions = load_sessions(sessions_dir())
     metrics.push_consent_valid_until({label: consent_valid_until(s) for label, s in sessions.items()})
     if replay_run is not None:
-        replay(replay_run, sessions, write, since)
+        replay(replay_run, sessions, write, since_date)
         return
     if write:
         prune_failed_runs(raw_root())
