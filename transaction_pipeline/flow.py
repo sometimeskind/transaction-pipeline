@@ -20,9 +20,11 @@ paths and dates only, and no result is persisted to Prefect's result storage.
 A run's raw pages are deleted once they are stored; a failed run's pages stay
 as evidence for RAW_KEEP_FAILED_DAYS, then the next run deletes them.
 
-`replay_run=<run-id>` maps and stores a saved run directory without fetching
-anything: the go-live backfill is fetched once in save-only mode right after
-consent, and replayed after the clean start. It is not a failure-recovery
+`replay_run=<run-id>` (or a list of run ids, mapped together) maps and stores
+saved run directories without fetching anything: the go-live backfill is
+fetched once per login in save-only mode right after consent, and the backfills
+and the daily runs since are replayed together after the clean start, so moves
+between the logins' accounts pair. `since` leaves out bookings before a date. It is not a failure-recovery
 mechanism (the overlapping window is) and never prunes. A replay that writes
 deletes the replayed pages once stored, like any successful run.
 
@@ -281,6 +283,10 @@ class StoreCounts:
     skipped: int = 0
     # Mapped but not stored, because FIREFLY_WRITE is off (replay only).
     not_written: int = 0
+    # Internal moves left for the next run, because an account has no pages this run.
+    deferred: int = 0
+    # Internal moves without a name that pair with nothing and match no rule.
+    unpaired: int = 0
 
     def __add__(self, other: StoreCounts) -> StoreCounts:
         return StoreCounts(
@@ -288,30 +294,54 @@ class StoreCounts:
             self.existing + other.existing,
             self.skipped + other.skipped,
             self.not_written + other.not_written,
+            self.deferred + other.deferred,
+            self.unpaired + other.unpaired,
         )
 
     def __str__(self) -> str:
-        return f"{self.created} created, {self.existing} existing, {self.skipped} skipped, {self.not_written} not written"
+        text = f"{self.created} created, {self.existing} existing, {self.skipped} skipped, {self.not_written} not written"
+        for name in ("deferred", "unpaired"):
+            if getattr(self, name):
+                text += f", {getattr(self, name)} {name}"
+        return text
+
+
+Pages = dict[str, list[Path]]
 
 
 def store_from_disk(
     client: firefly.FireflyClient,
     sessions: dict[str, dict],
-    pages: dict[str, list[Path]],
+    pages: Pages | list[Pages],
     rules: list | None = None,
     *,
     write: bool = True,
+    since: date | None = None,
 ) -> StoreCounts:
     """Map every saved transaction and store it in Firefly unless its external_id is there already.
+
+    `pages` is one run's pages per account uid, or a list of several runs'.
 
     Every session account counts as imported, fetched this run or not, so the
     side of a transfer between two banks is chosen the same way every run.
 
-    An account listed by several sessions (shared between two logins) is mapped
-    once, from the first session that has pages for it. Its keys are the same
-    under every session (they hash the account key, not the uid), so mapping it
-    twice would only look up every booking twice.
+    An account's bookings are the union, by key, of what every run fetched for it
+    under every session. Keys hash the account key, not the uid, so an account
+    shared between two logins has the same keys under both, and so do the days
+    two overlapping runs share. Bookings before `since` are left out.
+
+    Internal moves are paired across all accounts (mapping.pair_internal_moves).
+    When an account has no pages at all (its fetch failed), the other side of a
+    move may be missing, so no internal move is stored: they are counted as
+    deferred, and the next run's overlapping window covers them. The same goes for
+    internal moves on the latest booking day in the pages: a run may have seen
+    only part of that day, and pairing a partial day could pair its
+    interchangeable bookings differently from the run that sees all of it, which
+    would attach a stored transfer to the wrong account. Internal moves
+    without a name that pair with nothing and match no rule aren't stored either;
+    once everything else is stored, the store raises UnpairedMoveError.
     """
+    runs = [pages] if isinstance(pages, dict) else pages
     accounts = all_accounts(sessions)
     keys = {account["uid"]: account_key(account) for account in accounts}
     book = mapping.AccountBook.from_firefly(
@@ -320,24 +350,49 @@ def store_from_disk(
         rules=rules or [],
         imported_numbers=[value for kind, value in keys.values() if kind == "number"],
     )
+    first_uid: dict[tuple[str, str], str] = {}
+    owns: dict[tuple[str, str], mapping.OwnAccount] = {}
+    bookings: dict[tuple[str, str], list[mapping.Booking]] = {}
+    seen: dict[tuple[str, str], set[str]] = {}
+    for run in runs:
+        for account in accounts:
+            uid = account["uid"]
+            if uid not in run:
+                continue
+            key = keys[uid]
+            if key not in first_uid:
+                kind, value = key
+                own = book.get(value) if kind == "iban" else book.get_by_number(value)
+                if own is None:
+                    raise mapping.MappingError(f"session account {uid} has no Firefly asset account")
+                first_uid[key], owns[key], bookings[key], seen[key] = uid, own, [], set()
+            elif uid != first_uid[key]:
+                log.info("account %s is account %s under another session, mapped together", uid, first_uid[key])
+            transactions = load_transactions(run[uid])
+            for raw, external_id in zip(transactions, mapping.external_ids(key, transactions), strict=True):
+                if external_id in seen[key]:
+                    continue
+                seen[key].add(external_id)
+                if since is None or mapping.booking_day(raw) >= since:
+                    bookings[key].append(mapping.Booking(owns[key], raw, external_id))
+    complete = set(keys.values()) <= set(bookings)
+    pairing = mapping.pair_internal_moves(b for bs in bookings.values() for b in bs) if complete else None
+    if not complete:
+        log.warning("not every account has pages this run, so internal moves are left for the next run")
+    last_day = max((mapping.booking_day(b.raw) for bs in bookings.values() for b in bs), default=None)
     total = StoreCounts()
-    mapped: dict[tuple[str, str], str] = {}
-    for account in accounts:
-        if account["uid"] not in pages:
-            continue
-        key = keys[account["uid"]]
-        if key in mapped:
-            log.info("account %s is account %s under another session, mapped once", account["uid"], mapped[key])
-            continue
-        mapped[key] = account["uid"]
-        kind, value = key
-        own = book.get(value) if kind == "iban" else book.get_by_number(value)
-        if own is None:
-            raise mapping.MappingError(f"session account {account['uid']} has no Firefly asset account")
-        transactions = load_transactions(pages[account["uid"]])
-        created = existing = skipped = not_written = 0
-        for raw, external_id in zip(transactions, mapping.external_ids(key, transactions), strict=True):
-            payload = mapping.map_transaction(raw, own, book, external_id)
+    for key, uid in first_uid.items():
+        created = existing = skipped = not_written = deferred = unpaired = 0
+        for b in bookings[key]:
+            if mapping.is_internal_move(b.raw) and (pairing is None or mapping.booking_day(b.raw) == last_day):
+                deferred += 1
+                continue
+            try:
+                payload = mapping.map_transaction(
+                    b.raw, b.account, book, b.external_id, pairing.partner.get(b.external_id) if pairing else None)
+            except mapping.UnpairedMoveError:
+                unpaired += 1
+                continue
             if payload is None:
                 skipped += 1
             elif not write:
@@ -346,9 +401,14 @@ def store_from_disk(
                 created += 1
             else:
                 existing += 1
-        counts = StoreCounts(created, existing, skipped, not_written)
-        log.info("account %s: %s", account["uid"], counts)
+        counts = StoreCounts(created, existing, skipped, not_written, deferred, unpaired)
+        log.info("account %s: %s", uid, counts)
         total += counts
+    if total.unpaired:
+        raise mapping.UnpairedMoveError(
+            f"{total.unpaired} internal move(s) without a name pair with no other booking and match no rule "
+            "(counts per account above); everything else is stored"
+        )
     return total
 
 
@@ -382,11 +442,11 @@ def fetch_pages(run_dir: Path, date_from: date, date_to: date) -> Fetched:
     cache_policy=NO_CACHE,
     persist_result=False,
 )
-def store_pages(pages: dict[str, list[Path]], write: bool = True) -> StoreCounts:
+def store_pages(pages: Pages | list[Pages], write: bool = True, since: date | None = None) -> StoreCounts:
     sessions = load_sessions(sessions_dir())
     rules = mapping.load_rules(mapping_config())
     with firefly_client() as client:
-        counts = store_from_disk(client, sessions, pages, rules, write=write)
+        counts = store_from_disk(client, sessions, pages, rules, write=write, since=since)
     log.info("all accounts: %s", counts)
     return counts
 
@@ -412,16 +472,21 @@ def run_id() -> str:
 
 
 @flow(name="transaction-import", persist_result=False)
-def import_flow(window_days: int = WINDOW_DAYS, replay_run: str | None = None) -> None:
+def import_flow(
+    window_days: int = WINDOW_DAYS, replay_run: str | list[str] | None = None, since: date | None = None
+) -> None:
     """Fetch booked transactions from Enable Banking and write them to Firefly III.
 
-    With `replay_run`, map and store that saved run's pages instead of fetching.
+    With `replay_run` (one run id or a list), map and store those saved runs'
+    pages together instead of fetching, leaving out bookings before `since`.
     """
+    if since is not None and replay_run is None:
+        raise ValueError("since only applies to a replay_run")
     write = firefly_write()
     sessions = load_sessions(sessions_dir())
     metrics.push_consent_valid_until({label: consent_valid_until(s) for label, s in sessions.items()})
     if replay_run is not None:
-        replay(replay_run, sessions, write)
+        replay(replay_run, sessions, write, since)
         return
     if write:
         prune_failed_runs(raw_root())
@@ -445,18 +510,23 @@ def import_flow(window_days: int = WINDOW_DAYS, replay_run: str | None = None) -
         metrics.push_success()
 
 
-def replay(replay_run: str, sessions: dict[str, dict], write: bool) -> None:
-    """Map (and with `write`, store and then delete) a saved run. No fetch, no pruning.
+def replay(replay_run: str | list[str], sessions: dict[str, dict], write: bool, since: date | None = None) -> None:
+    """Map (and with `write`, store and then delete) saved runs, in one pass. No fetch, no pruning.
 
-    Pushes no success timestamp: that says the daily import is current, and a
-    replay fetches nothing new.
+    Several runs are mapped together so that moves pair across them: each login's
+    go-live backfill is its own run. Pushes no success timestamp: that says the
+    daily import is current, and a replay fetches nothing new.
     """
-    if not RUN_ID_PATTERN.fullmatch(replay_run):
-        raise ValueError(f"replay_run {replay_run!r} is not a run id")
-    run_dir = raw_root() / replay_run
-    pages = saved_pages(run_dir, sessions)
+    runs = [replay_run] if isinstance(replay_run, str) else list(replay_run)
+    if not runs:
+        raise ValueError("replay_run names no run")
+    for run in runs:
+        if not RUN_ID_PATTERN.fullmatch(run):
+            raise ValueError(f"replay_run {run!r} is not a run id")
+    pages = [saved_pages(raw_root() / run, sessions) for run in runs]
     if not write:
-        log.warning("FIREFLY_WRITE is not true: replaying run %s maps only, stores nothing", replay_run)
-    store_pages(pages, write)
+        log.warning("FIREFLY_WRITE is not true: replaying run(s) %s maps only, stores nothing", ", ".join(runs))
+    store_pages(pages, write, since)
     if write:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        for run in runs:
+            shutil.rmtree(raw_root() / run, ignore_errors=True)

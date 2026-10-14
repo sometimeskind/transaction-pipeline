@@ -65,11 +65,16 @@ by hand.
 **Backfill at go-live.** The first fetch right after consent is exempt from the PSD2
 budget and gets the most history, so it runs save-only with a large `window_days`
 (e.g. 1095) and its pages stay on the PVC. After the clean start, the flow parameter
-`replay_run=<run-id>` maps and stores that run's pages without fetching. It honours
+`replay_run=<run-id>` maps and stores that run's pages without fetching. Given a list
+of run ids, it maps them in one pass, each account's bookings being the union by key
+of every run's: each login's backfill is its own run, and moves between a shared
+Space and either login's account only pair when both are mapped together. Add the
+save-only daily runs since the backfills to cover the days up to go-live, and
+`since=<date>` to leave out the days before every account's history starts. It honours
 `FIREFLY_WRITE`: when that is off, it maps only and stores nothing, which checks the
 rules against real data. A replay never prunes and pushes no success timestamp. A
-replay that writes deletes the replayed pages once they are stored. It is for the backfill only: failure recovery is the overlapping
-window. A run saved before a re-consent can't be replayed, because accounts get new
+replay that writes deletes the replayed pages once they are stored. It is for the
+backfill only: failure recovery is the overlapping window. A run saved before a re-consent can't be replayed, because accounts get new
 uids on re-consent.
 
 One bank login failing (expired consent, rate limit) doesn't stop the others: their
@@ -111,7 +116,7 @@ Prefect review in homelab#1983):
 
 `mapping.py` turns one raw Enable Banking transaction into one Firefly
 transaction: a withdrawal, a deposit, or a transfer when the other side is an own
-account. Own accounts are found in three ways:
+account. Own accounts are found in four ways, in this order:
 
 - **By IBAN:** any Firefly asset account with its IBAN set. A transfer between
   two imported accounts is created once, from its debit side.
@@ -123,16 +128,38 @@ account. Own accounts are found in three ways:
   under `STATE_DIR/sessions/`) in its **account number**, leaving the IBAN
   empty. A run fails while an imported account has no Firefly account with its
   IBAN or hash.
+- **By pairing internal moves:** some banks book a move between two own accounts
+  as a SEPA credit transfer (`ICDT/ESCT` out, `RCDT/ESCT` in) whose counterparty
+  shows no IBAN or account number, and often no name, on both sides (N26 Spaces,
+  and some transfers between two N26 customers). The text doesn't reliably say
+  which account is on the other side. So each run pairs these *internal moves*
+  across every imported account of every session: an outgoing and an incoming one
+  on two accounts, on the same `booking_date`, with the same amount and currency,
+  and the same remittance text or none on one side. A pair becomes one transfer
+  from its debit side. Where several bookings could pair, it pairs only when no
+  choice between accounts is involved (the side being chosen from is all on one
+  account, so its bookings are interchangeable).
 - **By rule:** for own accounts that bookings don't name by IBAN, such as
   sub-accounts or a payment service in the middle. Rules live in a TOML file at
   `MAPPING_CONFIG` (default `/config/mapping.toml`). The file is optional, and no
   file means no rules. The deployment mounts it from a secret, because the real
   rules describe our accounts and never go in this repo. The format is in the
-  `mapping.py` docstring.
+  `mapping.py` docstring. A rule can be limited to bookings on one account
+  (`booked_on`) and can say the other side never appears in the bank data
+  (`other_side_missing`), so the credit itself is the transfer: N26 round-ups show
+  as a credit on the Space, while the card payment carries the purchase amount only.
+
+An internal move without a counterparty name that neither pairs nor matches a rule
+is never booked against Firefly's cash account: it isn't stored, and the run fails
+with a count per account once everything else is stored. When an account has no
+pages in a run (its fetch failed), the other side of a move may be missing, so that
+run stores no internal moves at all and counts them as deferred; the next run's
+overlapping window pairs them. Internal moves on the latest booking day in a run's
+pages are deferred too, since the run may have seen only part of that day.
 
 An account that two logins share (a shared Space, a joint account) is listed by
-both sessions under different uids, and is mapped once per run, from the first
-session that fetched it. Its bookings get the same keys under either session.
+both sessions under different uids. Its bookings get the same keys under either
+session, so a run maps the union, by key, of what both sessions fetched for it.
 
 `firefly.py` stores each transaction only when no transaction with its
 `external_id` exists, and never updates an existing one.
