@@ -538,6 +538,67 @@ def test_a_choice_between_accounts_leaves_the_bookings_unpaired():
     assert len(pairing.unpaired) == 3
 
 
+def test_a_same_day_round_trip_pairs_each_way():
+    # Out to a space and back again, same amount and text: each debit has one possible credit.
+    bookings = _bookings(
+        (CHECKING, _move("DBIT")), (CHECKING, _move("CRDT")),
+        (SPACE, _move("DBIT")), (SPACE, _move("CRDT")),
+    )
+
+    assert _pairs(bookings) == {
+        "0": "Synthetic space", "3": "Synthetic checking", "2": "Synthetic checking", "1": "Synthetic space",
+    }
+
+
+def test_bookings_with_and_without_text_on_one_account_are_interchangeable():
+    # The same space pays both current accounts; only one of its debits carries the text.
+    bookings = _bookings(
+        (SPACE, _move("DBIT", text="From space to main")), (SPACE, _move("DBIT", text=None)),
+        (CHECKING, _move("CRDT", text="From space to main")), (SAVINGS, _move("CRDT", text="From space to main")),
+    )
+
+    pairs = _pairs(bookings)
+
+    assert {pairs["0"], pairs["1"]} == {"Synthetic checking", "Synthetic savings"}
+    assert pairs["2"] == pairs["3"] == "Synthetic space"
+
+
+def test_a_booking_whose_only_partner_is_taken_leaves_the_other_its_one_choice():
+    # Space -> other space and other space -> checking, all the same amount, texts only on one side.
+    bookings = _bookings(
+        (SPACE, _move("DBIT", text=None)), (OTHER_SPACE, _move("DBIT", text=None)),
+        (OTHER_SPACE, _move("CRDT", text=None)), (CHECKING, _move("CRDT", text="From other space to main")),
+    )
+
+    assert _pairs(bookings) == {
+        "0": "Synthetic other space", "2": "Synthetic space", "1": "Synthetic checking", "3": "Synthetic other space",
+    }
+
+
+def test_equal_text_wins_over_no_text():
+    bookings = _bookings(
+        (CHECKING, _move("DBIT")), (SPACE, _move("DBIT", text=None)), (OTHER_SPACE, _move("CRDT")),
+    )
+
+    pairing = pair_internal_moves(bookings)
+
+    assert _pairs(bookings) == {"0": "Synthetic other space", "2": "Synthetic checking"}
+    assert [b.external_id[-1] for b in pairing.unpaired] == ["1"]
+
+
+def test_a_group_too_large_to_search_is_left_unpaired(monkeypatch):
+    monkeypatch.setattr("transaction_pipeline.mapping.MATCHING_SEARCH_LIMIT", 3)
+    bookings = _bookings(
+        (CHECKING, _move("DBIT")), (CHECKING, _move("CRDT")),
+        (SPACE, _move("DBIT")), (SPACE, _move("CRDT")),
+    )
+
+    pairing = pair_internal_moves(bookings)
+
+    assert pairing.partner == {}
+    assert len(pairing.unpaired) == 4
+
+
 def test_the_same_bookings_in_another_order_pair_the_same_way():
     bookings = _bookings(
         (CHECKING, _move("DBIT")), (CHECKING, _move("DBIT")),
@@ -601,6 +662,70 @@ def test_load_rules_reads_booked_on_and_other_side_missing(tmp_path):
     [rule] = load_rules(path)
 
     assert (rule.booked_on, rule.other_side_missing) == ("Synthetic space", True)
+
+
+BANK_REFUND_RULE = CounterpartyRule(
+    None, remittance=re.compile("^synthetic fee refund", re.IGNORECASE), counterparty="Synthetic Bank",
+)
+BANK_REFUND_BOOK = AccountBook([CHECKING, SPACE], [(BANK_REFUND_RULE, None)])
+
+
+def test_a_counterparty_rule_names_a_nameless_booking_that_is_no_move():
+    split = _split(map_transaction(_move("CRDT", text="Synthetic fee refund"), CHECKING, BANK_REFUND_BOOK, KEY))
+
+    assert split["type"] == "deposit"
+    assert (split["destination_id"], split["source_name"]) == ("1", "Synthetic Bank")
+
+
+def test_a_counterparty_rule_leaves_a_named_booking_alone():
+    raw = _move("CRDT", text="Synthetic fee refund", debtor={"name": "Example Friend"})
+
+    assert _split(map_transaction(raw, CHECKING, BANK_REFUND_BOOK, KEY))["source_name"] == "Example Friend"
+
+
+def test_a_pair_wins_over_a_counterparty_rule():
+    raw = _move("DBIT", text="Synthetic fee refund")
+
+    assert _split(map_transaction(raw, CHECKING, BANK_REFUND_BOOK, KEY, paired=SPACE))["type"] == "transfer"
+
+
+def test_load_rules_reads_counterparty_rules(tmp_path):
+    path = tmp_path / "rules.toml"
+    path.write_text(
+        '[[own_counterparty]]\naccount = "Synthetic checking"\nremittance = "^Round-up$"\n'
+        '[[counterparty]]\nname = "Synthetic Bank"\nremittance = "^Synthetic fee refund"\nbooked_on = "Synthetic checking"\n'
+    )
+
+    own, bank = load_rules(path)
+
+    assert (own.account, own.counterparty) == ("Synthetic checking", None)
+    assert (bank.account, bank.counterparty, bank.booked_on) == (None, "Synthetic Bank", "Synthetic checking")
+    assert bank.remittance.search("synthetic FEE refund")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[[counterparty]]\nremittance = "x"\n',
+        '[[counterparty]]\nname = "Synthetic Bank"\n',
+        '[[counterparty]]\nname = "Synthetic Bank"\nremittance = "x"\nother_side_missing = true\n',
+    ],
+)
+def test_load_rules_rejects_incomplete_counterparty_rules(tmp_path, body):
+    path = tmp_path / "rules.toml"
+    path.write_text(body)
+
+    with pytest.raises(MappingError, match="counterparty"):
+        load_rules(path)
+
+
+def test_counterparty_rules_resolve_without_an_own_account():
+    accounts = [{"id": "1", "attributes": {"name": "Synthetic checking", "iban": CHECKING.iban}}]
+
+    book = AccountBook.from_firefly(accounts, [CHECKING.iban], rules=[BANK_REFUND_RULE])
+    split = _split(map_transaction(_move("CRDT", text="Synthetic fee refund"), book.get(CHECKING.iban), book, KEY))
+
+    assert split["source_name"] == "Synthetic Bank"
 
 
 def test_a_rule_booked_on_a_missing_firefly_account_fails():

@@ -49,11 +49,22 @@ number, often not even a name, on both sides (N26 Spaces). Such an internal move
 is identified by its other side, not its text: `pair_internal_moves` pairs an
 outgoing and an incoming one on two accounts with the same booking_date, amount
 and currency, and the same remittance text or none on one side. Where several
-bookings could pair, it pairs only when no choice between accounts is involved:
-the side being chosen from is all on one account, so its bookings are
-interchangeable. An internal move without a counterparty name that neither
-pairs nor matches a rule raises `UnpairedMoveError` instead of being booked
-against the cash account; one with a name is mapped as usual.
+bookings could pair, each group of the same day, amount and currency is paired
+as a maximum matching, preferring equal texts, and only when every such matching
+gives the same transfers between accounts: which of two bookings on one account
+goes with which credit then makes no difference. An internal move without a
+counterparty name that neither pairs nor matches a rule raises
+`UnpairedMoveError` instead of being booked against the cash account; one with
+a name is mapped as usual.
+
+A nameless booking with those codes that is no move at all (a bank's own
+refund) gets a counterparty name from a `[[counterparty]]` rule, after
+pairing and the `[[own_counterparty]]` rules, and is then mapped as usual:
+
+    [[counterparty]]
+    name = "Example Bank"             # the counterparty name to book it against
+    remittance = "^fee refund"        # regex on the remittance text, required
+    booked_on = "Checking"            # optional, as above
 
 `imported_ibans` are the IBANs of the accounts this run fetches from Enable
 Banking. Some banks list sub-accounts without an IBAN (N26 Spaces); those are
@@ -128,9 +139,13 @@ class OwnAccount:
 
 @dataclass(frozen=True)
 class CounterpartyRule:
-    """A counterparty matching these patterns is the own account named `account`."""
+    """A counterparty matching these patterns is the own account named `account`.
 
-    account: str
+    A `[[counterparty]]` rule has no `account`: it gives a nameless booking the
+    counterparty name `counterparty` instead, so it is booked as usual.
+    """
+
+    account: str | None
     name: re.Pattern | None = None
     remittance: re.Pattern | None = None
     iban: str | None = None
@@ -138,6 +153,7 @@ class CounterpartyRule:
     booked_on: str | None = None
     # The other side never shows in the bank data, so a matching credit is the transfer.
     other_side_missing: bool = False
+    counterparty: str | None = None
 
     def matches(self, party_name: str | None, remittance: str) -> bool:
         if self.name is not None and not self.name.search(party_name or ""):
@@ -157,8 +173,9 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
     if not path.exists():
         log.info("no mapping rules at %s", path)
         return []
+    config = tomllib.loads(path.read_text())
     rules = []
-    for i, entry in enumerate(tomllib.loads(path.read_text()).get("own_counterparty", [])):
+    for i, entry in enumerate(config.get("own_counterparty", [])):
         unknown = set(entry) - {"account", "name", "remittance", "iban", "booked_on", "other_side_missing"}
         if unknown or "account" not in entry or not ({"name", "remittance"} & set(entry)):
             raise MappingError(
@@ -173,6 +190,21 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
                 iban=normalise_iban(entry["iban"]) if "iban" in entry else None,
                 booked_on=entry.get("booked_on"),
                 other_side_missing=entry.get("other_side_missing") is True,
+            )
+        )
+    for i, entry in enumerate(config.get("counterparty", [])):
+        unknown = set(entry) - {"name", "remittance", "booked_on"}
+        if unknown or not {"name", "remittance"} <= set(entry):
+            raise MappingError(
+                f"{path}: counterparty[{i}] needs name and remittance"
+                + (f", and has unknown keys {sorted(unknown)}" if unknown else "")
+            )
+        rules.append(
+            CounterpartyRule(
+                account=None,
+                remittance=re.compile(entry["remittance"], re.IGNORECASE),
+                booked_on=entry.get("booked_on"),
+                counterparty=entry["name"],
             )
         )
     return rules
@@ -224,7 +256,7 @@ class AccountBook:
             for name in (rule.account, rule.booked_on):
                 if name is not None and name not in by_name:
                     raise MappingError(f"rule names Firefly account {name!r}, which doesn't exist")
-            resolved.append((rule, by_name[rule.account]))
+            resolved.append((rule, by_name[rule.account] if rule.account is not None else None))
         return cls(own, resolved)
 
     def get(self, iban: str | None) -> OwnAccount | None:
@@ -249,12 +281,17 @@ class AccountBook:
 
     def rule_for(
         self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str
-    ) -> tuple[CounterpartyRule, OwnAccount] | None:
-        """The first rule matching a booking on `account`, with the own account it names."""
+    ) -> tuple[CounterpartyRule, OwnAccount | None] | None:
+        """The first rule matching a booking on `account`, with the own account it names.
+
+        A `[[counterparty]]` rule names no own account and only matches a booking without a counterparty name.
+        """
         party_iban = normalise_iban(party_iban or "") or None
         for rule, own in self._rules:
             expected = {rule.iban} if rule.iban else {None, account.iban}
             if rule.booked_on is not None and rule.booked_on != account.name:
+                continue
+            if rule.counterparty is not None and party_name is not None:
                 continue
             if own != account and party_iban in expected and rule.matches(party_name, remittance):
                 return rule, own
@@ -337,9 +374,14 @@ class Pairing:
 def pair_internal_moves(bookings: Iterable[Booking]) -> Pairing:
     """Pair the internal moves among `bookings`, every imported account's (see module docstring).
 
-    Bookings with the same remittance text are paired first, then what is left
-    with bookings that have no text. The result depends only on the bookings, not
-    their order, so the same pages always give the same transfers.
+    Within each group of the same booking_date, amount and currency, a debit and a
+    credit can pair when they are on different accounts and have the same
+    remittance text or one has none. The group is paired as a maximum matching,
+    preferring equal texts, and only when every such matching gives the same
+    transfers between accounts; then which of two bookings on one account goes
+    with which credit makes no difference. Otherwise nothing in the group pairs.
+    The result depends only on the bookings, not their order, so the same pages
+    always give the same transfers.
     """
     groups: defaultdict[tuple, tuple[list[Booking], list[Booking]]] = defaultdict(lambda: ([], []))
     for b in bookings:
@@ -348,46 +390,103 @@ def pair_internal_moves(bookings: Iterable[Booking]) -> Pairing:
             groups[(day, amount, currency)][direction == "CRDT"].append(b)
     pairing = Pairing()
     for debits, credits in groups.values():
-        left_d: list[Booking] = []
-        left_c: list[Booking] = []
-        for text in sorted({_remittance(b.raw) for b in debits + credits} - {""}):
-            d, c = _pair(pairing, [b for b in debits if _remittance(b.raw) == text],
-                         [b for b in credits if _remittance(b.raw) == text])
-            left_d += d
-            left_c += c
-        bare_d = [b for b in debits if not _remittance(b.raw)]
-        bare_c = [b for b in credits if not _remittance(b.raw)]
-        left_d, bare_c = _pair(pairing, left_d, bare_c)
-        bare_d, left_c = _pair(pairing, bare_d, left_c)
-        bare_d, bare_c = _pair(pairing, bare_d, bare_c)
-        pairing.unpaired += left_d + left_c + bare_d + bare_c
+        _pair_group(pairing, debits, credits)
     return pairing
 
 
-def _pair(pairing: Pairing, debits: list[Booking], credits: list[Booking]) -> tuple[list[Booking], list[Booking]]:
-    """Pair what can be paired without choosing between accounts; return what is left of each side.
+# Search budget per group; a group that needs more stays unpaired (and fails loudly).
+MATCHING_SEARCH_LIMIT = 100_000
 
-    One side must be all on one account, so its bookings are interchangeable,
-    and either have enough bookings for every booking of the other side or the
-    other side must be all on one account too.
-    """
-    debits = sorted(debits, key=lambda b: b.external_id)
-    credits = sorted(credits, key=lambda b: b.external_id)
-    for chosen, choosing in ((debits, credits), (credits, debits)):
-        accounts = {b.account for b in chosen}
-        if len(accounts) != 1:
-            continue
-        others = [b for b in choosing if b.account not in accounts]
-        if len(chosen) < len(others) and len({b.account for b in others}) > 1:
-            continue
-        n = min(len(chosen), len(others))
-        for a, b in zip(chosen[:n], others[:n], strict=True):
+
+class _SearchTooLarge(Exception):
+    pass
+
+
+def _classes(bookings: list[Booking]) -> list[list[Booking]]:
+    """Bookings by account and remittance text, the interchangeable ones together, lowest key first."""
+    by: defaultdict[tuple[str, str], list[Booking]] = defaultdict(list)
+    for b in bookings:
+        by[(b.account.firefly_id, _remittance(b.raw))].append(b)
+    return [sorted(by[k], key=lambda b: b.external_id) for k in sorted(by)]
+
+
+def _pair_group(pairing: Pairing, debits: list[Booking], credits: list[Booking]) -> None:
+    d_classes, c_classes = _classes(debits), _classes(credits)
+    edges = []
+    for i, d in enumerate(d_classes):
+        for j, c in enumerate(c_classes):
+            td, tc = _remittance(d[0].raw), _remittance(c[0].raw)
+            if d[0].account != c[0].account and (td == tc or not td or not tc):
+                edges.append((i, j, td == tc))
+    try:
+        best = _best_matchings(edges, [len(d) for d in d_classes], [len(c) for c in c_classes])
+    except _SearchTooLarge:
+        log.warning("%d internal moves of one day and amount have too many ways to pair; left unpaired",
+                    len(debits) + len(credits))
+        best = []
+    outcomes = {frozenset((+_transfers(edges, counts, d_classes, c_classes)).items()) for counts in best}
+    if len(outcomes) != 1:
+        pairing.unpaired += debits + credits
+        return
+    taken: set[int] = set()
+    d_next = [0] * len(d_classes)
+    c_next = [0] * len(c_classes)
+    for (i, j, _), n in zip(edges, best[0], strict=True):
+        for _ in range(n):
+            a, b = d_classes[i][d_next[i]], c_classes[j][c_next[j]]
+            d_next[i] += 1
+            c_next[j] += 1
             pairing.partner[a.external_id] = b.account
             pairing.partner[b.external_id] = a.account
-        taken = set(others[:n])
-        rest_chosen, rest_choosing = chosen[n:], [b for b in choosing if b not in taken]
-        return (rest_chosen, rest_choosing) if chosen is debits else (rest_choosing, rest_chosen)
-    return debits, credits
+            taken |= {id(a), id(b)}
+    pairing.unpaired += [b for b in debits + credits if id(b) not in taken]
+
+
+def _transfers(edges, counts, d_classes, c_classes) -> Counter:
+    """How many transfers a matching makes from each account to each other one."""
+    out: Counter = Counter()
+    for (i, j, _), n in zip(edges, counts, strict=True):
+        out[(d_classes[i][0].account, c_classes[j][0].account)] += n
+    return out
+
+
+def _best_matchings(edges: list[tuple[int, int, bool]], rows: list[int], cols: list[int]) -> list[tuple[int, ...]]:
+    """Every way to pair the most bookings, then the most with equal text: a count per edge.
+
+    `edges` link a debit class to a credit class; `rows` and `cols` are how many
+    bookings each class has. Raises _SearchTooLarge past MATCHING_SEARCH_LIMIT steps.
+    """
+    rows, cols = list(rows), list(cols)
+    best: tuple[int, int] = (-1, -1)
+    found: list[tuple[int, ...]] = []
+    counts = [0] * len(edges)
+    steps = 0
+
+    def visit(k: int, size: int, equal: int) -> None:
+        nonlocal best, found, steps
+        steps += 1
+        if steps > MATCHING_SEARCH_LIMIT:
+            raise _SearchTooLarge
+        if size + min(sum(rows), sum(cols)) < best[0]:
+            return
+        if k == len(edges):
+            if (size, equal) > best:
+                best, found = (size, equal), [tuple(counts)]
+            elif (size, equal) == best:
+                found.append(tuple(counts))
+            return
+        i, j, same = edges[k]
+        for n in range(min(rows[i], cols[j]), -1, -1):
+            counts[k] = n
+            rows[i] -= n
+            cols[j] -= n
+            visit(k + 1, size + n, equal + n * same)
+            rows[i] += n
+            cols[j] += n
+        counts[k] = 0
+
+    visit(0, 0, 0)
+    return found
 
 
 def map_transaction(
@@ -421,6 +520,8 @@ def map_transaction(
         if found is not None:
             rule, other_own = found
             one_sided = rule.other_side_missing
+            if rule.counterparty is not None:
+                party_name = rule.counterparty
     if other_own is None and party_name is None and is_internal_move(raw):
         raise UnpairedMoveError(f"{external_id}: internal move booked {booking_date} has no other side")
 

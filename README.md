@@ -136,9 +136,12 @@ account. Own accounts are found in four ways, in this order:
   across every imported account of every session: an outgoing and an incoming one
   on two accounts, on the same `booking_date`, with the same amount and currency,
   and the same remittance text or none on one side. A pair becomes one transfer
-  from its debit side. Where several bookings could pair, it pairs only when no
-  choice between accounts is involved (the side being chosen from is all on one
-  account, so its bookings are interchangeable).
+  from its debit side. Where several bookings could pair (the same amount moved
+  out and back on one day, or a Space paying both current accounts), each group
+  of the same day, amount and currency is paired as a maximum matching, preferring
+  equal texts. It pairs only when every such matching gives the same transfers
+  between accounts, so which of two bookings on one account goes with which
+  credit makes no difference; otherwise nothing in the group pairs.
 - **By rule:** for own accounts that bookings don't name by IBAN, such as
   sub-accounts or a payment service in the middle. Rules live in a TOML file at
   `MAPPING_CONFIG` (default `/config/mapping.toml`). The file is optional, and no
@@ -148,6 +151,12 @@ account. Own accounts are found in four ways, in this order:
   (`booked_on`) and can say the other side never appears in the bank data
   (`other_side_missing`), so the credit itself is the transfer: N26 round-ups show
   as a credit on the Space, while the card payment carries the purchase amount only.
+- **Not a move at all:** a nameless booking with the same bank codes that isn't
+  a move between own accounts, such as a bank's own refund (N26 chargeback
+  refunds, fee refunds), gets a counterparty name from a `[[counterparty]]` rule
+  (`name` and `remittance`, optional `booked_on`). It is then booked as an
+  ordinary deposit or withdrawal. Such a rule never applies to a booking that
+  has a name.
 
 An internal move without a counterparty name that neither pairs nor matches a rule
 is never booked against Firefly's cash account: it isn't stored, and the run fails
