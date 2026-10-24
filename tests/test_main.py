@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from transaction_pipeline import __main__ as cli
-from transaction_pipeline import flow
+from transaction_pipeline import flow, spend
 from transaction_pipeline.enable_banking import AuthStart, ConsentRedirectError
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -60,23 +60,34 @@ def state(monkeypatch, tmp_path):
 
 @pytest.fixture
 def serve(monkeypatch):
+    """`serve` receives the two deployments; each flow's to_deployment is replaced by its kwargs."""
     served, umasks = [], []
-    monkeypatch.setattr(flow.import_flow, "serve", lambda **kw: served.append(kw))
+    monkeypatch.setattr(flow.import_flow, "to_deployment", lambda **kw: ("import", kw))
+    monkeypatch.setattr(spend.spend_flow, "to_deployment", lambda **kw: ("spend", kw))
+    monkeypatch.setattr(cli, "serve", lambda *deployments: served.append(list(deployments)))
     monkeypatch.setattr(cli.os, "umask", umasks.append)
     return served, umasks
 
 
 @pytest.mark.parametrize("argv", [[], ["serve"]])
-def test_serve_is_the_default_and_unscheduled_without_fetch_cron(monkeypatch, serve, argv):
+def test_serve_is_the_default_and_unscheduled_without_crons(monkeypatch, serve, argv):
     monkeypatch.delenv("FETCH_CRON", raising=False)
+    monkeypatch.delenv("SPEND_CRON", raising=False)
     assert cli.main(argv) == 0
-    assert serve == ([{"name": "transaction-import", "cron": None}], [0o077])
+    assert serve == ([[
+        ("import", {"name": "transaction-import", "cron": None}),
+        ("spend", {"name": "spend-burn-up", "cron": None}),
+    ]], [0o077])
 
 
-def test_serve_schedules_on_fetch_cron(monkeypatch, serve):
+def test_serve_schedules_each_deployment_on_its_own_cron(monkeypatch, serve):
     monkeypatch.setenv("FETCH_CRON", "0 6 * * *")
+    monkeypatch.setenv("SPEND_CRON", "0 7 * * *")
     assert cli.main(["serve"]) == 0
-    assert serve[0] == [{"name": "transaction-import", "cron": "0 6 * * *"}]
+    assert serve[0] == [[
+        ("import", {"name": "transaction-import", "cron": "0 6 * * *"}),
+        ("spend", {"name": "spend-burn-up", "cron": "0 7 * * *"}),
+    ]]
 
 
 @pytest.mark.parametrize("argv", [
