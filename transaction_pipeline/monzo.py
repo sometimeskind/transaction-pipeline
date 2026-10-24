@@ -280,13 +280,17 @@ def amount_text(minor: int, currency: str) -> str:
 
 
 def pot_of(tx: dict) -> str | None:
-    """The pot id of a move between the account and one of its pots, else None."""
+    """The pot id of a move between the account and one of its pots, else None.
+
+    Only fields Monzo sets decide it: `metadata.pot_id`, or the pot scheme, under
+    which the description is the pot id. A payer's reference that happens to
+    start with `pot_` is a payment like any other.
+    """
     pot = (tx.get("metadata") or {}).get("pot_id")
-    description = str(tx.get("description") or "")
     if pot:
         return pot
-    if tx.get("scheme") == POT_SCHEME or description.startswith("pot_"):
-        return description or None
+    if tx.get("scheme") == POT_SCHEME:
+        return str(tx.get("description") or "") or None
     return None
 
 

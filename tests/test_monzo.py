@@ -294,11 +294,19 @@ def test_a_pot_move_is_named_after_the_pot_and_carries_its_id():
 
 @pytest.mark.parametrize("over", [
     {"scheme": "uk_retail_pot", "description": POT},
-    {"description": POT},
     {"metadata": {"pot_id": POT}, "description": "something else"},
 ])
-def test_a_pot_move_is_recognised_by_metadata_scheme_or_description(over):
+def test_a_pot_move_is_recognised_by_metadata_or_scheme(over):
     assert monzo.pot_of(tx(**over)) == POT
+
+
+def test_a_payment_whose_reference_looks_like_a_pot_id_is_no_pot_move():
+    raw = monzo.to_raw(tx(amount=2500, merchant=None, scheme="payport_faster_payments", description=POT,
+                          counterparty={"name": "Synthetic Stranger", "sort_code": "040004", "account_number": "11111111"}), {POT: "Synthetic pot"})
+    assert monzo.pot_of(tx(description=POT)) is None
+    assert raw["debtor"] == {"name": "Synthetic Stranger"}
+    assert raw["debtor_account"]["other"]["identification"] == "04000411111111"
+    assert raw["remittance_information"] == [POT]
 
 
 def test_a_pot_the_session_does_not_know_keeps_its_id_as_name():
