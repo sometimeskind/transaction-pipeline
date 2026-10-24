@@ -757,3 +757,67 @@ def test_an_unknown_account_number_stays_a_stranger():
     raw = _tx(creditor_account={"other": {"identification": "99999999999999"}})
     split = _split(map_transaction(raw, CHECKING, NUMBER_BOOK, KEY))
     assert (split["type"], split["destination_number"]) == ("withdrawal", "99999999999999")
+
+
+# Pass-through transfers
+
+from transaction_pipeline.mapping import PassThroughError  # noqa: E402
+
+PASS_IBAN = "XX00SYNTHETIC0000000009"
+PASS_THROUGH = OwnAccount("9", "Synthetic pass-through", PASS_IBAN, imported=False, currency="EUR")
+GBP_CURRENT = OwnAccount("7", "Synthetic UK account", None, imported=True, number=UK_NUMBER, currency="GBP")
+PASS_BOOK = AccountBook([GBP_CURRENT, PASS_THROUGH, CHECKING])
+TRANSFER_KEYS = ("type", "source_id", "destination_id", "amount", "currency_code", "foreign_amount", "foreign_currency_code")
+
+
+def _gbp(**overrides) -> dict:
+    raw = _tx(transaction_amount={"currency": "GBP", "amount": "100.00"}, creditor={"name": "Synthetic pass-through"},
+              creditor_account={"iban": PASS_IBAN})
+    raw.update(overrides)
+    return raw
+
+
+def test_a_transfer_into_a_pass_through_account_needs_the_leg_amount():
+    with pytest.raises(PassThroughError, match="needs the amount in EUR") as exc:
+        map_transaction(_gbp(), GBP_CURRENT, PASS_BOOK, KEY)
+    assert (exc.value.account, exc.value.debit) == (PASS_THROUGH, True)
+
+
+def test_a_transfer_into_a_pass_through_account_books_the_leg_as_the_foreign_amount():
+    split = _split(map_transaction(_gbp(), GBP_CURRENT, PASS_BOOK, KEY, leg_amount="115.2"))
+    assert tuple(split[k] for k in TRANSFER_KEYS) == ("transfer", "7", "9", "100.00", "GBP", "115.2", "EUR")
+
+
+def test_a_credit_from_a_pass_through_account_is_booked_in_its_currency():
+    raw = _tx(credit_debit_indicator="CRDT", transaction_amount={"currency": "GBP", "amount": "100.00"},
+              debtor={"name": "Synthetic pass-through"}, debtor_account={"iban": PASS_IBAN})
+    with pytest.raises(PassThroughError) as exc:
+        map_transaction(raw, GBP_CURRENT, PASS_BOOK, KEY)
+    assert exc.value.debit is False
+    split = _split(map_transaction(raw, GBP_CURRENT, PASS_BOOK, KEY, leg_amount="115.2"))
+    assert tuple(split[k] for k in TRANSFER_KEYS) == ("transfer", "9", "7", "115.2", "EUR", "100.00", "GBP")
+
+
+def test_a_pass_through_account_in_the_booking_currency_is_a_plain_transfer():
+    split = _split(map_transaction(_tx(creditor_account={"iban": PASS_IBAN}), CHECKING, PASS_BOOK, KEY))
+    assert (split["type"], split["destination_id"]) == ("transfer", "9") and "foreign_amount" not in split
+
+
+def test_an_instructed_amount_from_the_bank_needs_no_leg():
+    raw = _gbp(exchange_rate={"instructed_amount": {"amount": "-115.20", "currency": "EUR"}})
+    split = _split(map_transaction(raw, GBP_CURRENT, PASS_BOOK, KEY))
+    assert (split["foreign_amount"], split["foreign_currency_code"]) == ("115.20", "EUR")
+
+
+def test_an_imported_account_in_another_currency_is_no_pass_through():
+    other = OwnAccount("10", "Synthetic imported EUR", "XX00SYNTHETIC0000000010", imported=True, currency="EUR")
+    raw = _gbp(creditor_account={"iban": other.iban})
+    split = _split(map_transaction(raw, GBP_CURRENT, AccountBook([GBP_CURRENT, other]), KEY))
+    assert (split["type"], split["destination_id"]) == ("transfer", "10") and "foreign_amount" not in split
+
+
+def test_account_book_reads_the_currency():
+    accounts = [{"id": "1", "attributes": {"name": "Synthetic", "iban": CHECKING.iban, "currency_code": "gbp"}},
+                {"id": "2", "attributes": {"name": "Synthetic too", "iban": SAVINGS.iban}}]
+    book = AccountBook.from_firefly(accounts, imported_ibans=[])
+    assert (book.get(CHECKING.iban).currency, book.get(SAVINGS.iban).currency) == ("GBP", None)

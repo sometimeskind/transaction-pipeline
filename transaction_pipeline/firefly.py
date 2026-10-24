@@ -21,6 +21,7 @@ changed, and both need a human.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 
 import httpx
@@ -47,6 +48,8 @@ class ExternalIdConflictError(Exception):
 class StoreResult:
     created: bool
     group_id: str
+    # The split's transaction_journal_id, what transaction links refer to.
+    journal_id: str | None = None
 
 
 class FireflyClient:
@@ -126,9 +129,33 @@ class FireflyClient:
         existing = self.find_by_external_id(external_id)
         if existing is not None:
             _check_same_booking(existing, split)
-            return StoreResult(created=False, group_id=existing["id"])
+            return StoreResult(created=False, group_id=existing["id"], journal_id=_journal_id(existing, external_id))
         body = self._request("POST", "/v1/transactions", json=payload)
-        return StoreResult(created=True, group_id=body["data"]["id"])
+        return StoreResult(created=True, group_id=body["data"]["id"], journal_id=_journal_id(body["data"], external_id))
+
+    def account_transactions(self, account_id: str, start: date, end: date, type: str = "transfer") -> list[dict]:
+        """The splits of every transaction on `account_id` dated `start` to `end` (inclusive), of one type."""
+        params = {"start": start.isoformat(), "end": end.isoformat(), "type": type}
+        groups = self._paged(f"/v1/accounts/{account_id}/transactions", params)
+        return [split for group in groups for split in group["attributes"]["transactions"]]
+
+    def links_of(self, journal_id: str) -> list[dict]:
+        """The transaction links of one split; [] when it has none."""
+        return self._paged(f"/v1/transaction-journals/{journal_id}/links", {})
+
+    def link(self, inward_id: str, outward_id: str, link_type: str = "Related", notes: str | None = None) -> dict:
+        """Link two splits by journal id with a link type named `link_type` (Firefly ships "Related")."""
+        body: dict = {"link_type_name": link_type, "inward_id": inward_id, "outward_id": outward_id}
+        if notes:
+            body["notes"] = notes
+        return self._request("POST", "/v1/transaction-links", json=body)["data"]
+
+
+def _journal_id(group: dict, external_id: str) -> str | None:
+    for split in (group.get("attributes") or {}).get("transactions") or []:
+        if split.get("external_id") == external_id:
+            return split.get("transaction_journal_id")
+    return None
 
 
 def _single_split(payload: dict) -> dict:

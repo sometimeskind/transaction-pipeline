@@ -53,6 +53,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -84,6 +85,8 @@ STORE_RETRIES = 2
 STORE_RETRY_DELAY_SECONDS = 30
 # Raw pages left behind by a failed run, kept for debugging, then deleted.
 RAW_KEEP_FAILED_DAYS = 7
+# How many days after a pass-through transfer its other leg may be dated (store_pass_through).
+PASS_THROUGH_DAYS = 7
 
 CONSENT_HINT = "run `python -m transaction_pipeline consent {label} ...` in the transaction-pipeline pod"
 MONZO_HINT = "run `python -m transaction_pipeline monzo-auth {label} --redirect-url ...` in the transaction-pipeline pod"
@@ -381,9 +384,10 @@ class StoreCounts:
     skipped: int = 0
     # Mapped but not stored, because FIREFLY_WRITE is off (replay only).
     not_written: int = 0
-    # Internal moves left for the next run, because an account has no pages this run.
+    # Left for the next run: internal moves when an account has no pages this run
+    # or on the latest booking day, and pass-through transfers whose leg isn't there yet.
     deferred: int = 0
-    # Internal moves without a name that pair with nothing and match no rule.
+    # Pair with nothing: nameless internal moves matching no rule, pass-through transfers without a leg.
     unpaired: int = 0
 
     def __add__(self, other: StoreCounts) -> StoreCounts:
@@ -438,6 +442,9 @@ def store_from_disk(
     would attach a stored transfer to the wrong account. Internal moves
     without a name that pair with nothing and match no rule aren't stored either;
     once everything else is stored, the store raises UnpairedMoveError.
+
+    Pass-through transfers (mapping.PassThroughError) are stored last, by
+    `store_pass_through`, so a leg stored by this run is in Firefly by then.
     """
     runs = [pages] if isinstance(pages, dict) else pages
     accounts = all_accounts(sessions)
@@ -480,6 +487,7 @@ def store_from_disk(
         log.warning("not every account has pages this run, so internal moves are left for the next run")
     last_day = max((mapping.booking_day(b.raw) for bs in bookings.values() for b in bs), default=None)
     total = StoreCounts()
+    pass_through: list[PassThrough] = []
     for key, uid in first_uid.items():
         created = existing = skipped = not_written = deferred = unpaired = 0
         for b in bookings[key]:
@@ -492,6 +500,9 @@ def store_from_disk(
             except mapping.UnpairedMoveError:
                 unpaired += 1
                 continue
+            except mapping.PassThroughError as exc:
+                pass_through.append(PassThrough(b, exc.account, exc.debit))
+                continue
             if payload is None:
                 skipped += 1
             elif not write:
@@ -503,12 +514,106 @@ def store_from_disk(
         counts = StoreCounts(created, existing, skipped, not_written, deferred, unpaired)
         log.info("account %s: %s", uid, counts)
         total += counts
+    total += store_pass_through(client, book, pass_through, last_day, write)
     if total.unpaired:
         raise mapping.UnpairedMoveError(
-            f"{total.unpaired} internal move(s) without a name pair with no other booking and match no rule "
-            "(counts per account above); everything else is stored"
+            f"{total.unpaired} unpaired booking(s): internal moves without a name that match no rule, or "
+            "pass-through transfers without a leg (counts above); everything else is stored"
         )
     return total
+
+
+@dataclass(frozen=True)
+class PassThrough:
+    """A booking that is a transfer with a pass-through account, waiting for that account's amount."""
+
+    booking: mapping.Booking
+    account: mapping.OwnAccount
+    debit: bool
+
+
+def store_pass_through(
+    client: firefly.FireflyClient, book: mapping.AccountBook, bookings: list[PassThrough], last_day: date | None, write: bool
+) -> StoreCounts:
+    """Store the transfers with a pass-through account, each with its other leg's amount from Firefly.
+
+    A pass-through account (Wise between a GBP and a EUR account) is in Firefly
+    but not imported, and keeps another currency than the booking. Firefly needs
+    the transfer's amount in that currency too, and only the account's other leg
+    has it: the transfer out of it (for a debit into it; into it for a credit
+    from it) to another own account, already in Firefly, dated from the booking
+    day to PASS_THROUGH_DAYS later. Oldest booking first, each takes the earliest
+    such leg that has no transaction link yet, and the two are linked once
+    stored, which makes the claim visible in Firefly and a rerun idempotent.
+
+    No leg yet while the window is still open (relative to the latest booking
+    day in the run) leaves the booking for a later run; a closed window counts
+    it as unpaired, and the store fails after everything else, like an unpaired
+    move. The way out is to create the missing leg by hand in Firefly.
+    """
+    created = existing = not_written = deferred = unpaired = 0
+    claimed: set[str] = set()
+    for item in sorted(bookings, key=lambda p: (mapping.booking_day(p.booking.raw), p.booking.external_id)):
+        b, other = item.booking, item.account
+        day = mapping.booking_day(b.raw)
+        leg = find_leg(client, other, item.debit, day, claimed)
+        if leg is None:
+            if last_day is not None and day + timedelta(days=PASS_THROUGH_DAYS) >= last_day:
+                deferred += 1
+                log.info("%s: transfer with %s booked %s has no leg in Firefly yet; left for a later run",
+                         b.external_id, other.name, day)
+            else:
+                unpaired += 1
+                log.error("%s: transfer with %s booked %s has no leg %s %s within %d days; create it in Firefly by hand",
+                          b.external_id, other.name, day, "out of" if item.debit else "into", other.name, PASS_THROUGH_DAYS)
+            continue
+        claimed.add(leg["transaction_journal_id"])
+        payload = mapping.map_transaction(b.raw, b.account, book, b.external_id, leg_amount=amount_in(leg, other))
+        assert payload is not None
+        if not write:
+            not_written += 1
+            continue
+        result = client.store_if_absent(payload)
+        if result.created:
+            created += 1
+        else:
+            existing += 1
+        if result.journal_id is None:
+            log.warning("%s: stored without a journal id, so it can't be linked to its leg", b.external_id)
+        elif result.created or not client.links_of(result.journal_id):
+            client.link(result.journal_id, leg["transaction_journal_id"])
+    counts = StoreCounts(created, existing, 0, not_written, deferred, unpaired)
+    if bookings:
+        log.info("pass-through transfers: %s", counts)
+    return counts
+
+
+def find_leg(
+    client: firefly.FireflyClient, other: mapping.OwnAccount, debit: bool, day: date, claimed: set[str]
+) -> dict | None:
+    """The earliest unlinked transfer out of `other` (debit) or into it (credit) within PASS_THROUGH_DAYS of `day`."""
+    side = "source_id" if debit else "destination_id"
+    splits = client.account_transactions(other.firefly_id, day, day + timedelta(days=PASS_THROUGH_DAYS), "transfer")
+    candidates = sorted(
+        (s for s in splits
+         if str(s.get(side)) == other.firefly_id and s.get("transaction_journal_id") not in claimed
+         and amount_in(s, other) is not None),
+        key=lambda s: (str(s.get("date") or "")[:10], int(s["transaction_journal_id"])),
+    )
+    for split in candidates:
+        if not client.links_of(split["transaction_journal_id"]):
+            return split
+    return None
+
+
+def amount_in(split: dict, other: mapping.OwnAccount) -> str | None:
+    """A Firefly split's amount in `other`'s currency: its amount, or its foreign amount, else None."""
+    currency = (other.currency or "").upper()
+    if (split.get("currency_code") or "").upper() == currency and split.get("amount"):
+        return format(Decimal(split["amount"]).normalize(), "f")
+    if (split.get("foreign_currency_code") or "").upper() == currency and split.get("foreign_amount"):
+        return format(Decimal(split["foreign_amount"]).normalize(), "f")
+    return None
 
 
 def check_pots(sessions: dict[str, dict], book: mapping.AccountBook) -> None:
