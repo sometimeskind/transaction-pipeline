@@ -131,3 +131,54 @@ def test_validation_error_carries_firefly_messages(firefly):
         firefly.store_if_absent(_payload())
     assert err.value.status_code == 422
     assert "transactions.0.amount" in err.value.errors
+
+
+# Journal ids, account transactions and links (pass-through transfers)
+
+from datetime import date  # noqa: E402
+
+CREATED = {"data": {"type": "transactions", "id": "77",
+                    "attributes": {"transactions": [{"external_id": "ref-1", "transaction_journal_id": "501"}]}}}
+
+
+@respx.mock
+def test_a_created_transaction_reports_its_journal_id(firefly):
+    respx.get(SEARCH).respond(json=_page([]))
+    respx.post(STORE).respond(200, json=CREATED)
+    assert firefly.store_if_absent(_payload()) == StoreResult(created=True, group_id="77", journal_id="501")
+
+
+@respx.mock
+def test_an_existing_transaction_reports_its_journal_id(firefly):
+    group = _group("5", "ref-1")
+    group["attributes"]["transactions"][0]["transaction_journal_id"] = "401"
+    respx.get(SEARCH).respond(json=_page([group]))
+    assert firefly.store_if_absent(_payload()) == StoreResult(created=False, group_id="5", journal_id="401")
+
+
+@respx.mock
+def test_account_transactions_flatten_the_splits_of_a_date_range(firefly):
+    route = respx.get(f"{URL}/api/v1/accounts/9/transactions").respond(json=_page([
+        {"id": "1", "attributes": {"transactions": [{"transaction_journal_id": "11"}, {"transaction_journal_id": "12"}]}},
+        {"id": "2", "attributes": {"transactions": [{"transaction_journal_id": "21"}]}},
+    ]))
+    splits = firefly.account_transactions("9", date(2026, 1, 2), date(2026, 1, 9))
+    assert [s["transaction_journal_id"] for s in splits] == ["11", "12", "21"]
+    params = route.calls[0].request.url.params
+    assert (params["start"], params["end"], params["type"]) == ("2026-01-02", "2026-01-09", "transfer")
+
+
+@respx.mock
+def test_links_of_a_journal(firefly):
+    respx.get(f"{URL}/api/v1/transaction-journals/11/links").respond(
+        json=_page([{"id": "3", "attributes": {"inward_id": "11", "outward_id": "21"}}]))
+    respx.get(f"{URL}/api/v1/transaction-journals/12/links").respond(json=_page([]))
+    assert [link["id"] for link in firefly.links_of("11")] == ["3"]
+    assert firefly.links_of("12") == []
+
+
+@respx.mock
+def test_link_posts_the_type_by_name(firefly):
+    route = respx.post(f"{URL}/api/v1/transaction-links").respond(200, json={"data": {"id": "3"}})
+    assert firefly.link("11", "21")["id"] == "3"
+    assert json.loads(route.calls[0].request.content) == {"link_type_name": "Related", "inward_id": "11", "outward_id": "21"}

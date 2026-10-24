@@ -80,6 +80,17 @@ own accounts is imported:
   imported too, because its debit already makes the transfer. When the other
   account is only in Firefly (not fetched), the credit is the only side we ever
   see, so it becomes the transfer.
+- A transfer with an own account that is not imported and keeps another
+  currency (a payment service in the middle, such as Wise between a GBP and a
+  EUR account) is a *pass-through* transfer: Firefly needs the amount in that
+  account's currency too (`foreign_amount`), and the bank data has only this
+  side's. Unless the bank sent an instructed amount, `map_transaction` raises
+  `PassThroughError`, and the flow calls it again with `leg_amount`: the amount
+  of that account's other leg, found in Firefly (flow.store_pass_through). For a
+  debit it becomes the foreign amount; for a credit the leg amount is the
+  transfer's amount, in the source account's currency, and the booked amount the
+  foreign one. Two imported accounts in different currencies are not handled:
+  Firefly would reject the transfer, loudly.
 
 The Firefly `external_id`, the idempotency key, is derived from the booking's
 content by `external_ids`: `tp1:` and a SHA-256 hex digest of the account key
@@ -129,6 +140,18 @@ class UnpairedMoveError(MappingError):
     """An internal move without a counterparty name matched no other booking and no rule."""
 
 
+class PassThroughError(MappingError):
+    """A transfer with a pass-through account needs that account's amount: call again with `leg_amount`."""
+
+    def __init__(self, account: OwnAccount, debit: bool, external_id: str):
+        self.account = account
+        self.debit = debit
+        super().__init__(
+            f"{external_id}: transfer {'to' if debit else 'from'} {account.name} ({account.currency}) needs the "
+            f"amount in {account.currency}, which this booking doesn't carry"
+        )
+
+
 @dataclass(frozen=True)
 class OwnAccount:
     firefly_id: str
@@ -138,6 +161,8 @@ class OwnAccount:
     # Firefly's account_number: for an account without an IBAN, an identification_hash,
     # a sort code and account number, or a Monzo pot id.
     number: str | None = None
+    # Firefly's currency_code; decides whether a transfer with this account is a pass-through one.
+    currency: str | None = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +268,7 @@ class AccountBook:
             own.append(OwnAccount(
                 item["id"], item["attributes"]["name"], iban,
                 iban in imported or number in imported_numbers, number,
+                (item["attributes"].get("currency_code") or "").strip().upper() or None,
             ))
         missing_ibans = imported - {a.iban for a in own}
         missing_numbers = imported_numbers - {a.number for a in own}
@@ -493,12 +519,20 @@ def _best_matchings(edges: list[tuple[int, int, bool]], rows: list[int], cols: l
 
 
 def map_transaction(
-    raw: dict, account: OwnAccount, book: AccountBook, external_id: str, paired: OwnAccount | None = None
+    raw: dict,
+    account: OwnAccount,
+    book: AccountBook,
+    external_id: str,
+    paired: OwnAccount | None = None,
+    leg_amount: str | None = None,
 ) -> dict | None:
     """The Firefly store payload for `raw`, booked on `account`; None to skip it (see module docstring).
 
     `external_id` is the booking's key from `external_ids`; `paired` is the own
-    account on the other side when `pair_internal_moves` paired the booking.
+    account on the other side when `pair_internal_moves` paired the booking;
+    `leg_amount` is the other side's amount of a pass-through transfer, in the
+    pass-through account's currency, without which such a booking raises
+    `PassThroughError`.
     """
     booking_date = booking_day(raw).isoformat()
     money = raw["transaction_amount"]
@@ -548,6 +582,16 @@ def map_transaction(
             return None
         source, destination = (account, other_own) if debit else (other_own, account)
         split.update(type="transfer", source_id=source.firefly_id, destination_id=destination.firefly_id)
+        if is_pass_through(other_own, money["currency"], split):
+            if leg_amount is None:
+                raise PassThroughError(other_own, debit, external_id)
+            booked = split["amount"]
+            if debit:
+                split.update(foreign_amount=leg_amount, foreign_currency_code=other_own.currency)
+            else:
+                # Firefly books a transfer in the source account's currency; the booked side is the foreign one.
+                split.update(amount=leg_amount, currency_code=other_own.currency,
+                             foreign_amount=booked, foreign_currency_code=money["currency"])
     elif debit:
         split.update(type="withdrawal", source_id=account.firefly_id)
         split.update(_counterparty("destination", party_name, party_iban, party_number))
@@ -561,6 +605,16 @@ def map_transaction(
         "fire_webhooks": True,
         "transactions": [split],
     }
+
+
+def is_pass_through(other: OwnAccount, currency: str, split: dict) -> bool:
+    """A transfer with an own account we don't import, in another currency, whose amount the bank can't tell us."""
+    return (
+        not other.imported
+        and other.currency is not None
+        and other.currency.upper() != (currency or "").upper()
+        and "foreign_amount" not in split
+    )
 
 
 def _party(raw: dict, debit: bool) -> tuple[dict | None, dict | None]:
