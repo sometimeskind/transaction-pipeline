@@ -44,7 +44,7 @@ class AccountComparison:
 
 def keys_by_day(sessions: dict[str, dict], uid: str, paths: list[Path]) -> dict[date, set[str]]:
     account = next(a for a in flow.all_accounts(sessions) if a["uid"] == uid)
-    transactions = flow.load_transactions(paths)
+    transactions = flow.transactions_of(flow.session_of(sessions, uid), paths)
     days: dict[date, set[str]] = {}
     for raw, key in zip(transactions, mapping.external_ids(flow.account_key(account), transactions), strict=True):
         days.setdefault(mapping.booking_day(raw), set()).add(key)

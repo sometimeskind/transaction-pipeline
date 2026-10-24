@@ -5,14 +5,14 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import cloudpickle
 import httpx
 import pytest
 
-from transaction_pipeline import flow, mapping, metrics
+from transaction_pipeline import compare, flow, mapping, metrics, monzo
 from transaction_pipeline.enable_banking import EnableBankingError, RateLimitedError, SessionGoneError
 from transaction_pipeline.firefly import ExternalIdConflictError, FireflyError, StoreResult
 from transaction_pipeline.flow import BankBudgetSpentError, ConsentNeededError, Fetched, import_flow
@@ -803,3 +803,178 @@ def test_since_without_a_replay_is_refused(state, monkeypatch):
     with pytest.raises(ValueError, match="since"):
         harness.run(since="2026-01-02")
     assert harness.events == []
+
+
+# Monzo sessions: fetched from their own API, adapted when read back.
+
+MONZO_ACC = "acc_0000synthetic00000000001"
+MONZO_NUMBER = "04000412345678"
+MONZO_POT = "pot_0000synthetic00000000001"
+
+
+def monzo_session(token: bool = True, pots: list | None = None) -> dict:
+    return {
+        "provider": "monzo",
+        "token": {"access_token": "access-1", "refresh_token": "refresh-1", "expires_at": "2027-01-01T00:00:00+00:00"} if token else None,
+        "authorised_at": "2026-01-01T00:00:00+00:00",
+        "access": {"valid_until": "2026-03-31T23:55:00+00:00"},
+        "accounts": [{"uid": MONZO_ACC, "number": MONZO_NUMBER, "currency": "GBP", "type": "uk_retail"}],
+        "pots": [{"id": MONZO_POT, "name": "Synthetic pot", "deleted": False}] if pots is None else pots,
+    }
+
+
+def mtx(id: str, amount: int = -510, **over) -> dict:
+    base = {"id": id, "amount": amount, "currency": "GBP", "created": "2026-01-02T12:20:18Z",
+            "settled": "2026-01-02T12:20:18Z", "description": "SYNTHETIC GROCER LONDON GBR",
+            "merchant": {"id": "merch_1", "name": "Synthetic Grocer"}, "metadata": {}, "notes": ""}
+    base.update(over)
+    return base
+
+
+class FakeMonzo:
+    def __init__(self, pages: dict[str, list[dict]], errors: dict[str, Exception] | None = None):
+        self.pages, self.errors, self.calls = pages, errors or {}, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def transaction_pages(self, uid, since, before):
+        self.calls.append((uid, since, before))
+        if uid in self.errors:
+            raise self.errors[uid]
+        yield from self.pages.get(uid, [])
+
+
+def test_account_key_uses_the_number_of_a_monzo_account():
+    assert flow.account_key({"uid": MONZO_ACC, "number": MONZO_NUMBER}) == ("number", MONZO_NUMBER)
+
+
+def test_a_monzo_session_is_fetched_from_its_own_api_with_the_settle_grace(tmp_path):
+    sessions = {"bank-two": SESSIONS["bank-two"], "monzo": monzo_session()}
+    fake = FakeMonzo({MONZO_ACC: [{"transactions": [mtx("tx_1")]}, {"transactions": [mtx("tx_2")]}]})
+    fetched = flow.save_pages(FakeBank(empty(UID_C)), sessions, tmp_path, FROM, TO, monzo_clients=lambda label, s: fake)
+    assert fetched.errors == []
+    assert set(fetched.pages) == {UID_C, MONZO_ACC}
+    assert fake.calls == [(MONZO_ACC, datetime(2025, 12, 2, tzinfo=UTC), datetime(2026, 1, 9, tzinfo=UTC))]
+    saved = [json.loads(p.read_text()) for p in fetched.pages[MONZO_ACC]]
+    assert [s["transactions"][0]["id"] for s in saved] == ["tx_1", "tx_2"]  # as the API returned them
+
+
+def test_monzo_access_gone_skips_that_login_with_the_auth_hint(tmp_path):
+    sessions = {"bank-two": SESSIONS["bank-two"], "monzo": monzo_session()}
+    gone = monzo.AccessGoneError(403, "forbidden.insufficient_permissions", "no")
+    fetched = flow.save_pages(FakeBank(empty(UID_C)), sessions, tmp_path, FROM, TO,
+                              monzo_clients=lambda label, s: FakeMonzo({}, {MONZO_ACC: gone}))
+    assert set(fetched.pages) == {UID_C}
+    [error] = fetched.errors
+    assert isinstance(error, ConsentNeededError)
+    assert "monzo-auth monzo" in str(error) and "forbidden.insufficient_permissions" in str(error)
+
+
+def test_another_monzo_error_fails_that_account_and_not_the_rest(tmp_path):
+    other = "acc_0000synthetic00000000002"
+    session = monzo_session()
+    session["accounts"].append({"uid": other, "number": "04000499999999", "currency": "GBP"})
+    fake = FakeMonzo({other: [{"transactions": []}]}, {MONZO_ACC: monzo.MonzoError(500, "internal_service", "oops")})
+    fetched = flow.save_pages(FakeBank({}), {"monzo": session}, tmp_path, FROM, TO, monzo_clients=lambda label, s: fake)
+    assert set(fetched.pages) == {other}
+    assert [type(e) for e in fetched.errors] == [monzo.MonzoError]
+
+
+def test_missing_monzo_credentials_fail_only_that_login(tmp_path, monkeypatch):
+    monkeypatch.delenv("MONZO_CLIENT_ID", raising=False)
+    monkeypatch.delenv("MONZO_CLIENT_SECRET", raising=False)
+    sessions = {"bank-two": SESSIONS["bank-two"], "monzo": monzo_session()}
+    fetched = flow.save_pages(FakeBank(empty(UID_C)), sessions, tmp_path, FROM, TO)
+    assert set(fetched.pages) == {UID_C}
+    [error] = fetched.errors
+    assert isinstance(error, ConsentNeededError) and "MONZO_CLIENT_ID" in str(error)
+
+
+def test_monzo_client_writes_a_refreshed_token_back_to_the_session_file(state, monkeypatch):
+    monkeypatch.setenv("MONZO_CLIENT_ID", "client-1")
+    monkeypatch.setenv("MONZO_CLIENT_SECRET", "secret-1")
+    session = monzo_session()
+    path = flow.write_json(flow.session_path("monzo"), session)
+    with flow.monzo_client("monzo", session) as client:
+        assert client.token.refresh_token == "refresh-1"
+        client.on_token(monzo.Token("access-2", "refresh-2", datetime(2026, 1, 1, 6, tzinfo=UTC)))
+    saved = json.loads(path.read_text())
+    assert saved["token"] == {"access_token": "access-2", "refresh_token": "refresh-2", "expires_at": "2026-01-01T06:00:00+00:00"}
+    assert saved["accounts"] == session["accounts"] and saved["pots"] == session["pots"]
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_monzo_session_without_a_token_asks_for_monzo_auth(monkeypatch):
+    monkeypatch.setenv("MONZO_CLIENT_ID", "client-1")
+    monkeypatch.setenv("MONZO_CLIENT_SECRET", "secret-1")
+    with pytest.raises(ConsentNeededError, match="monzo-auth monzo"):
+        flow.monzo_client("monzo", monzo_session(token=False))
+
+
+class MonzoFirefly(FakeFirefly):
+    def __init__(self, pot: bool = True):
+        super().__init__()
+        self.pot = pot
+
+    def accounts(self, account_type="asset"):
+        accounts = [
+            {"id": "1", "attributes": {"iban": IBAN_A, "name": "Synthetic A"}},
+            {"id": "7", "attributes": {"iban": None, "account_number": MONZO_NUMBER, "name": "Synthetic current"}},
+        ]
+        if self.pot:
+            accounts.append({"id": "8", "attributes": {"iban": None, "account_number": MONZO_POT, "name": "Synthetic pot"}})
+        return accounts
+
+
+def monzo_pages() -> list[dict]:
+    return [{"transactions": [
+        mtx("tx_1"),
+        mtx("tx_2", amount=-2000, merchant=None, scheme="uk_retail_pot", description=MONZO_POT, metadata={"pot_id": MONZO_POT}),
+        mtx("tx_3", settled=""),
+    ]}]
+
+
+def test_monzo_pages_are_adapted_when_stored_and_pot_moves_are_transfers(tmp_path):
+    sessions = {"monzo": monzo_session()}
+    fetched = flow.save_pages(FakeBank({}), sessions, tmp_path, FROM, TO,
+                              monzo_clients=lambda label, s: FakeMonzo({MONZO_ACC: monzo_pages()}))
+    firefly = MonzoFirefly()
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(created=2)
+    splits = [p["transactions"][0] for p in firefly.stored]
+    assert [s["type"] for s in splits] == ["withdrawal", "transfer"]
+    assert (splits[0]["source_id"], splits[0]["destination_name"], splits[0]["amount"], splits[0]["currency_code"]) == (
+        "7", "Synthetic Grocer", "5.10", "GBP")
+    assert (splits[1]["source_id"], splits[1]["destination_id"], splits[1]["amount"], splits[1]["internal_reference"]) == (
+        "7", "8", "20.00", "tx_2")
+    assert splits[0]["external_id"] == mapping.external_ids(("number", MONZO_NUMBER), monzo.adapt([mtx("tx_1")], {}))[0]
+    # The same pages again store nothing new.
+    assert flow.store_from_disk(firefly, sessions, fetched.pages) == flow.StoreCounts(existing=2)
+
+
+def test_a_pot_without_a_firefly_account_fails_by_name(tmp_path):
+    sessions = {"monzo": monzo_session()}
+    fetched = flow.save_pages(FakeBank({}), sessions, tmp_path, FROM, TO,
+                              monzo_clients=lambda label, s: FakeMonzo({MONZO_ACC: monzo_pages()}))
+    firefly = MonzoFirefly(pot=False)
+    with pytest.raises(mapping.MappingError, match="Synthetic pot"):
+        flow.store_from_disk(firefly, sessions, fetched.pages)
+    assert firefly.stored == []
+
+
+def test_a_deleted_pot_needs_no_firefly_account(tmp_path):
+    sessions = {"monzo": monzo_session(pots=[{"id": MONZO_POT, "name": "Synthetic pot", "deleted": True}])}
+    fetched = flow.save_pages(FakeBank({}), sessions, tmp_path, FROM, TO,
+                              monzo_clients=lambda label, s: FakeMonzo({MONZO_ACC: [{"transactions": [mtx("tx_1")]}]}))
+    assert flow.store_from_disk(MonzoFirefly(pot=False), sessions, fetched.pages) == flow.StoreCounts(created=1)
+
+
+def test_compare_keys_reads_monzo_pages_through_the_adapter(tmp_path):
+    sessions = {"monzo": monzo_session()}
+    fetched = flow.save_pages(FakeBank({}), sessions, tmp_path, FROM, TO,
+                              monzo_clients=lambda label, s: FakeMonzo({MONZO_ACC: monzo_pages()}))
+    days = compare.keys_by_day(sessions, MONZO_ACC, fetched.pages[MONZO_ACC])
+    assert {d: len(k) for d, k in days.items()} == {date(2026, 1, 2): 2}

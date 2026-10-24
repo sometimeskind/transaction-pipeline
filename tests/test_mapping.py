@@ -315,7 +315,7 @@ def test_account_book_matches_an_account_without_iban_by_account_number():
 
 def test_account_book_fails_when_an_imported_account_number_is_not_in_firefly():
     accounts = [{"id": "6", "attributes": {"name": "Synthetic space", "iban": None, "account_number": "other"}}]
-    with pytest.raises(MappingError, match="identification_hash as its account number"):
+    with pytest.raises(MappingError, match="as its account number"):
         AccountBook.from_firefly(accounts, imported_ibans=[], imported_numbers=[SPACE_HASH])
 
 
@@ -734,3 +734,26 @@ def test_a_rule_booked_on_a_missing_firefly_account_fails():
 
     with pytest.raises(MappingError, match="No such account"):
         AccountBook.from_firefly(accounts, [CHECKING.iban], rules=[rule])
+
+
+UK_NUMBER = "04000412345678"
+UK_ACCOUNT = OwnAccount("7", "Synthetic UK account", None, imported=False, number=UK_NUMBER)
+NUMBER_BOOK = AccountBook([CHECKING, UK_ACCOUNT])
+
+
+def test_counterparty_matched_by_account_number_is_an_own_account():
+    raw = _tx(creditor={"name": "Someone"}, creditor_account={"other": {"identification": UK_NUMBER}})
+    split = _split(map_transaction(raw, CHECKING, NUMBER_BOOK, KEY))
+    assert (split["type"], split["source_id"], split["destination_id"]) == ("transfer", "1", "7")
+
+
+def test_a_counterparty_iban_is_matched_before_its_other_number():
+    raw = _tx(creditor_account={"iban": SAVINGS.iban, "other": {"identification": UK_NUMBER}})
+    split = _split(map_transaction(raw, CHECKING, NUMBER_BOOK, KEY))
+    assert split["destination_name"] == "Example Grocer"  # SAVINGS is not in this book, so no transfer
+
+
+def test_an_unknown_account_number_stays_a_stranger():
+    raw = _tx(creditor_account={"other": {"identification": "99999999999999"}})
+    split = _split(map_transaction(raw, CHECKING, NUMBER_BOOK, KEY))
+    assert (split["type"], split["destination_number"]) == ("withdrawal", "99999999999999")
