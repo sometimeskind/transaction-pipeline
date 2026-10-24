@@ -1,7 +1,9 @@
 """`python -m transaction_pipeline [serve | consent ... | compare-keys ...]`.
 
-`serve` (also the default, so the image's bare CMD keeps working) runs the Prefect
-deployment, scheduled by FETCH_CRON (unset: registered without a schedule).
+`serve` (also the default, so the image's bare CMD keeps working) runs the two
+Prefect deployments in one process: `transaction-import`, scheduled by FETCH_CRON,
+and `spend-burn-up` (spend.py), scheduled by SPEND_CRON (either unset: registered
+without a schedule).
 `consent` is run by hand in the pod, once per bank login, when consent is new or
 expired:
 
@@ -26,7 +28,9 @@ import sys
 from datetime import UTC, datetime, timedelta
 from typing import TextIO
 
-from transaction_pipeline import compare, flow
+from prefect import serve
+
+from transaction_pipeline import compare, flow, spend
 from transaction_pipeline.enable_banking import (
     ConsentRedirectError,
     EnableBankingClient,
@@ -137,9 +141,14 @@ def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     if args.command in (None, "serve"):
         cron = os.environ.get("FETCH_CRON") or None
+        spend_cron = os.environ.get("SPEND_CRON") or None
         logging.basicConfig(level=logging.INFO)
         log.info("transaction-import schedule: %s", cron or "none (FETCH_CRON unset)")
-        flow.import_flow.serve(name="transaction-import", cron=cron)
+        log.info("spend-burn-up schedule: %s", spend_cron or "none (SPEND_CRON unset)")
+        serve(
+            flow.import_flow.to_deployment(name="transaction-import", cron=cron),
+            spend.spend_flow.to_deployment(name="spend-burn-up", cron=spend_cron),
+        )
         return 0
     if args.command == "compare-keys":
         return run_compare_keys(args, sys.stdout)

@@ -38,11 +38,16 @@ published maximum.
 | `FIREFLY_WRITE` | `true` or `false` (default). Until `true`, runs only fetch and save raw pages |
 | `MAPPING_CONFIG` | mapping rules file, default `/config/mapping.toml`; no file means no rules |
 | `PUSHGATEWAY_URL` | metrics; unset means none are pushed |
+| `SPEND_CRON` | schedule for the `spend-burn-up` deployment (see [Spend burn-up](#spend-burn-up)); unset registers it without one |
+| `HA_WEBHOOK_URL` | the Home Assistant webhook the spend flow POSTs to, id included |
+| `SPEND_CURRENCY` | the currency the spend flow counts, default `EUR` |
+| `SPEND_TOTAL_BUDGET` | the Firefly budget whose limit is the overall spend target, default `Total` |
 
-Metrics, both in Pushgateway group `transaction-pipeline`:
-`transaction_pipeline_consent_valid_until_timestamp{session="LABEL"}` on every run, and
+Metrics, all in Pushgateway group `transaction-pipeline`:
+`transaction_pipeline_consent_valid_until_timestamp{session="LABEL"}` on every import run,
 `transaction_pipeline_last_success_timestamp` after a run that stored into Firefly
-(never in save-only mode, so a staleness alert keeps firing until the first real import).
+(never in save-only mode, so a staleness alert keeps firing until the first real import),
+and `transaction_pipeline_spend_last_success_timestamp` after a spend-burn-up run.
 
 ## State
 
@@ -79,6 +84,31 @@ uids on re-consent.
 
 One bank login failing (expired consent, rate limit) doesn't stop the others: their
 transactions are still stored, and the run then fails naming what went wrong.
+
+## Spend burn-up
+
+A second deployment, `spend-burn-up` (`spend.py`, [homelab#2030](https://github.com/sometimeskind/homelab/issues/2030)),
+served by the same process and scheduled by `SPEND_CRON`, usually an hour after the
+import. It turns the last 30 days of categorised spending into the series a Home
+Assistant wall tablet charts, one per category plus uncategorised and overall: the
+cumulative spend since the window began, a target and a six-window average. One
+webhook POST carries them all; the tablet hides the y-axis, so it shows how spend sits
+against the markers and never an amount.
+
+Nothing about a single transaction leaves Firefly. The flow reads the insight
+endpoints (`insight/expense/category`, `insight/income/category` for refunds,
+`insight/expense/no-category`), which return sums per category for a date range, once
+per day of the window and once per baseline window, plus the budget and category lists.
+Spend is withdrawals only, so transfers never count. A categorised deposit nets against
+its category; income without a category (salary) does not. Overall is the sum of the
+category nets plus the uncategorised expense, so the charts add up.
+
+The target of a category is the Firefly budget with the same name (case-insensitive): a
+monthly auto-budget's amount, or any other budget's limit covering today scaled to 30
+days. No matching budget means no target marker. The overall target is the budget named
+`SPEND_TOTAL_BUDGET`. The average is the mean of the six 30-day windows before the
+current one, so the baseline doesn't include the month it is compared with. A run is a
+pure function of Firefly's state that day; `as_of=<date>` re-renders a past day.
 
 ## Data rule
 

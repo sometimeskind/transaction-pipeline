@@ -47,6 +47,17 @@ def push_success() -> None:
     _pushadd(registry)
 
 
+def push_spend_success() -> None:
+    """Pushed by the spend burn-up flow (spend.py) once Home Assistant has the day's series."""
+    registry = CollectorRegistry()
+    Gauge(
+        "transaction_pipeline_spend_last_success_timestamp",
+        "Unix timestamp of the last successful spend-burn-up run",
+        registry=registry,
+    ).set(time.time())
+    _pushadd(registry)
+
+
 def _pushadd(registry: CollectorRegistry) -> None:
     url = os.environ.get("PUSHGATEWAY_URL", "")
     if not url:

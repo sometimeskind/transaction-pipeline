@@ -5,12 +5,15 @@ idempotent store. Idempotency lives in Firefly, not in Prefect state: every
 imported transaction carries the Enable Banking `entry_reference` as its
 `external_id`, and `store_if_absent` looks that up before creating anything.
 
-Used by the flow:
+Used by the import flow:
 
     with FireflyClient(url, token) as firefly:
         accounts = firefly.accounts("asset")      # raw API `data` items
         result = firefly.store_if_absent(payload)  # payload from mapping.map_transaction
         result.created, result.group_id
+
+The spend flow (spend.py) adds read-only sums: `insight`, `categories`, `budgets`
+and `budget_limits`.
 
 An existing transaction is never updated. When one with the same `external_id`
 exists but books a different amount, `ExternalIdConflictError` is raised instead
@@ -21,6 +24,7 @@ changed, and both need a human.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 
 import httpx
@@ -96,6 +100,33 @@ class FireflyClient:
     def accounts(self, account_type: str = "asset") -> list[dict]:
         """All accounts of one type (`asset`, `liabilities`, …) as raw `data` items."""
         return self._paged("/v1/accounts", {"type": account_type})
+
+    def categories(self) -> list[dict]:
+        """Every category, as raw `data` items."""
+        return self._paged("/v1/categories", {})
+
+    def budgets(self) -> list[dict]:
+        """Every budget, as raw `data` items (auto-budget fields included)."""
+        return self._paged("/v1/budgets", {})
+
+    def budget_limits(self, budget_id: str, start: date, end: date) -> list[dict]:
+        """The budget's limits that overlap [start, end], as raw `data` items."""
+        params = {"start": start.isoformat(), "end": end.isoformat()}
+        return self._request("GET", f"/v1/budgets/{budget_id}/limits", params=params)["data"]
+
+    def insight(self, kind: str, group: str, start: date, end: date) -> list[dict]:
+        """One of Firefly's insight sums over [start, end], both inclusive.
+
+        `kind` is `expense` or `income`; `group` is `category` (one entry per
+        category and currency: `id`, `name`, `difference`, `currency_code`) or
+        `no-category` (one entry per currency, no name). Sums only: nothing about
+        a single transaction is in the response, which is why the spend flow
+        reads Firefly this way.
+        """
+        if kind not in ("expense", "income") or group not in ("category", "no-category"):
+            raise ValueError(f"no insight for {kind}/{group}")
+        params = {"start": start.isoformat(), "end": end.isoformat()}
+        return self._request("GET", f"/v1/insight/{kind}/{group}", params=params)["data"]
 
     def find_by_external_id(self, external_id: str) -> dict | None:
         """The transaction group whose split carries exactly this external_id, or None.
