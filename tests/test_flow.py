@@ -1055,12 +1055,9 @@ def pass_through_sessions() -> dict:
             "monzo": monzo_session(pots=[])}
 
 
-def fetch_both(tmp_path, eb_pages: dict, monzo_pages: list[dict]) -> Pages:
+def fetch_both(tmp_path, eb_pages: dict, monzo_pages: list[dict]) -> dict:
     return flow.save_pages(FakeBank(eb_pages), pass_through_sessions(), tmp_path, FROM, TO,
                            monzo_clients=lambda label, s: FakeMonzo({MONZO_ACC: monzo_pages})).pages
-
-
-Pages = dict
 
 
 def transfer_fields(payload: dict) -> tuple:
