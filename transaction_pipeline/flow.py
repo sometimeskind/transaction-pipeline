@@ -1,11 +1,14 @@
-"""The daily import: Enable Banking → raw pages on the state PVC → Firefly III.
+"""The daily import: Enable Banking and Monzo → raw pages on the state PVC → Firefly III.
 
 Prefect schedules and runs it, and is never the source of truth (homelab#1981):
 
 - The bank fetch has no retries. Each run spends one of the 4 unattended requests
   per account per 24h (PSD2 SCA RTS art. 36(5)).
 - Every bank login has its own session, STATE_DIR/sessions/<label>.json (written
-  by `consent <label>`); the flow fetches every account of every session.
+  by `consent <label>`, or `monzo-auth <label>` for a Monzo login, whose session
+  says `"provider": "monzo"`); the flow fetches every account of every session.
+  Monzo pages are saved as the API returns them and adapted to the Enable
+  Banking shape when they are read back (monzo.adapt), so the mapping is one.
 - Every raw page is written to STATE_DIR/raw/<flow-run-id>/<account-uid>/page-<n>.json
   before anything is mapped, and the store step reads the pages back from disk. So
   the store step can retry without touching the bank.
@@ -47,6 +50,7 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -56,7 +60,7 @@ from prefect import flow, task
 from prefect.cache_policies import NO_CACHE
 from prefect.runtime import flow_run
 
-from transaction_pipeline import firefly, mapping, metrics
+from transaction_pipeline import firefly, mapping, metrics, monzo
 from transaction_pipeline.enable_banking import (
     EnableBankingClient,
     EnableBankingError,
@@ -82,6 +86,7 @@ STORE_RETRY_DELAY_SECONDS = 30
 RAW_KEEP_FAILED_DAYS = 7
 
 CONSENT_HINT = "run `python -m transaction_pipeline consent {label} ...` in the transaction-pipeline pod"
+MONZO_HINT = "run `python -m transaction_pipeline monzo-auth {label} --redirect-url ...` in the transaction-pipeline pod"
 # A session label names a file and a Prometheus label value: keep it plain.
 LABEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 SAVE_ONLY_MARKER = "save-only"
@@ -151,17 +156,32 @@ def consent_valid_until(session: dict) -> float:
     return datetime.fromisoformat(session["access"]["valid_until"]).timestamp()
 
 
+def provider(session: dict) -> str:
+    """Which API a session is for: "enable_banking" (no `provider` key) or "monzo"."""
+    return session.get("provider") or "enable_banking"
+
+
+def session_of(sessions: dict[str, dict], uid: str) -> dict:
+    for session in sessions.values():
+        if any(a["uid"] == uid for a in session["accounts"]):
+            return session
+    raise KeyError(uid)
+
+
 def account_key(account: dict) -> tuple[str, str]:
-    """How a session account is matched to Firefly: ("iban", its IBAN), else ("number", its identification_hash).
+    """How a session account is matched to Firefly: ("iban", its IBAN), else ("number", an account number).
 
     Banks list some sub-accounts without an IBAN (N26 Spaces). Enable Banking's
     identification_hash is the same for an account in every session, also one
     authorised by another login, so it survives re-consent (the uid doesn't) and
-    a shared account seen through two logins has one key.
+    a shared account seen through two logins has one key. A Monzo account has no
+    IBAN either; its `number` is the sort code and account number (monzo.account_entry).
     """
     iban = (account.get("account_id") or {}).get("iban")
     if iban:
         return "iban", mapping.normalise_iban(iban)
+    if account.get("number"):
+        return "number", account["number"]
     if account.get("identification_hash"):
         return "number", account["identification_hash"]
     raise mapping.MappingError(
@@ -185,6 +205,27 @@ def firefly_client() -> firefly.FireflyClient:
     return firefly.FireflyClient(os.environ["FIREFLY_URL"], os.environ["FIREFLY_TOKEN"])
 
 
+def monzo_credentials() -> tuple[str, str]:
+    """The OAuth client id and secret, from the environment (a sealed secret in the cluster)."""
+    try:
+        return os.environ["MONZO_CLIENT_ID"], os.environ["MONZO_CLIENT_SECRET"]
+    except KeyError as exc:
+        raise ConsentNeededError(f"{exc.args[0]} is not set, so a Monzo login can't be used") from None
+
+
+def monzo_client(label: str, session: dict) -> monzo.MonzoClient:
+    """A client on the session's token that writes every new token back to the session file."""
+    client_id, client_secret = monzo_credentials()
+    if not session.get("token"):
+        raise ConsentNeededError(f"session {label} has no Monzo token: " + MONZO_HINT.format(label=label))
+
+    def persist(token: monzo.Token) -> None:
+        session["token"] = token.to_json()
+        write_json(session_path(label), session)
+
+    return monzo.MonzoClient(client_id, client_secret, monzo.Token.from_json(session["token"]), on_token=persist)
+
+
 @dataclass
 class Fetched:
     """Pages per account uid for the accounts fetched in full, and what failed."""
@@ -193,17 +234,30 @@ class Fetched:
     errors: list[Exception] = field(default_factory=list)
 
 
+MonzoClients = Callable[[str, dict], monzo.MonzoClient]
+
+
 def save_pages(
-    client: EnableBankingClient, sessions: dict[str, dict], run_dir: Path, date_from: date, date_to: date
+    client: EnableBankingClient,
+    sessions: dict[str, dict],
+    run_dir: Path,
+    date_from: date,
+    date_to: date,
+    monzo_clients: MonzoClients = monzo_client,
 ) -> Fetched:
     """Fetch every account's booked transactions, writing each page as it arrives.
 
     One bank login failing doesn't stop the others: a gone session skips the rest
     of that session's accounts, any other error skips that account. Pages of a
     failed account stay on disk but are not stored; the caller fails the run.
+    Monzo sessions are fetched from their own API (`monzo_clients` makes the
+    client for a label and session; the default reads the token from the session).
     """
     fetched = Fetched()
     for label, session in sessions.items():
+        if provider(session) == monzo.PROVIDER:
+            _save_monzo_pages(label, session, run_dir, date_from, date_to, fetched, monzo_clients)
+            continue
         for account in session["accounts"]:
             uid = account["uid"]
             paths: list[Path] = []
@@ -234,6 +288,42 @@ def save_pages(
             fetched.pages[uid] = paths
             log.info("session %s: account %s: %d page(s) saved, %s", label, uid, len(paths), fetch_summary(booking_dates))
     return fetched
+
+
+def _save_monzo_pages(
+    label: str, session: dict, run_dir: Path, date_from: date, date_to: date, fetched: Fetched, make_client: MonzoClients
+) -> None:
+    """One Monzo login's accounts. The window starts SETTLE_GRACE_DAYS early (monzo.py)."""
+    since = datetime.combine(date_from - timedelta(days=monzo.SETTLE_GRACE_DAYS), datetime.min.time(), UTC)
+    before = datetime.combine(date_to + timedelta(days=1), datetime.min.time(), UTC)
+    try:
+        client = make_client(label, session)
+    except ConsentNeededError as exc:
+        fetched.errors.append(exc)
+        log.error("%s", exc)
+        return
+    with client:
+        for account in session["accounts"]:
+            uid = account["uid"]
+            paths: list[Path] = []
+            booking_dates: list[str] = []
+            try:
+                for n, page in enumerate(client.transaction_pages(uid, since, before), start=1):
+                    paths.append(write_json(run_dir / uid / f"page-{n}.json", page))
+                    booking_dates += [monzo.settled_day(tx) or "" for tx in page.get("transactions") or []]
+            except monzo.AccessGoneError as exc:
+                fetched.errors.append(ConsentNeededError(
+                    f"session {label}: Monzo access is gone ({exc.code or exc.status_code}): the token can't be "
+                    "refreshed or the 90-day approval lapsed; " + MONZO_HINT.format(label=label)
+                ))
+                log.error("%s", fetched.errors[-1])
+                break
+            except monzo.MonzoError as exc:
+                fetched.errors.append(exc)
+                log.error("session %s: account %s: %s", label, uid, exc)
+                continue
+            fetched.pages[uid] = paths
+            log.info("session %s: account %s: %d page(s) saved, %s", label, uid, len(paths), fetch_summary(booking_dates))
 
 
 def fetch_summary(booking_dates: list[str]) -> str:
@@ -272,8 +362,16 @@ def saved_pages(run_dir: Path, sessions: dict[str, dict]) -> dict[str, list[Path
 
 
 def load_transactions(paths: list[Path]) -> list[dict]:
-    """One account's transactions from its saved pages, in page order."""
+    """One account's transactions from its saved pages, in page order, as the API returned them."""
     return [raw for path in paths for raw in json.loads(path.read_text()).get("transactions") or []]
+
+
+def transactions_of(session: dict, paths: list[Path]) -> list[dict]:
+    """One account's bookings from its saved pages, in the Enable Banking shape whatever the provider."""
+    transactions = load_transactions(paths)
+    if provider(session) == monzo.PROVIDER:
+        return monzo.adapt(transactions, {pot["id"]: pot["name"] for pot in session.get("pots", [])})
+    return transactions
 
 
 @dataclass(frozen=True)
@@ -350,6 +448,7 @@ def store_from_disk(
         rules=rules or [],
         imported_numbers=[value for kind, value in keys.values() if kind == "number"],
     )
+    check_pots(sessions, book)
     first_uid: dict[tuple[str, str], str] = {}
     owns: dict[tuple[str, str], mapping.OwnAccount] = {}
     bookings: dict[tuple[str, str], list[mapping.Booking]] = {}
@@ -368,7 +467,7 @@ def store_from_disk(
                 first_uid[key], owns[key], bookings[key], seen[key] = uid, own, [], set()
             elif uid != first_uid[key]:
                 log.info("account %s is account %s under another session, mapped together", uid, first_uid[key])
-            transactions = load_transactions(run[uid])
+            transactions = transactions_of(session_of(sessions, uid), run[uid])
             for raw, external_id in zip(transactions, mapping.external_ids(key, transactions), strict=True):
                 if external_id in seen[key]:
                     continue
@@ -410,6 +509,27 @@ def store_from_disk(
             "(counts per account above); everything else is stored"
         )
     return total
+
+
+def check_pots(sessions: dict[str, dict], book: mapping.AccountBook) -> None:
+    """Every pot of every Monzo session needs a Firefly asset account with the pot id as its account number.
+
+    Pots are sub-accounts like N26 Spaces, but have no feed of their own: their
+    moves appear on the current account, naming the pot by id. Without an account
+    for the pot, those moves would be booked against an expense named after it.
+    A deleted pot is not required; its old moves map to an expense of its name.
+    """
+    missing = [
+        f"session {label}: pot {pot['id']} ({pot['name']})"
+        for label, session in sessions.items()
+        for pot in session.get("pots", [])
+        if not pot.get("deleted") and book.get_by_number(pot["id"]) is None
+    ]
+    if missing:
+        raise mapping.MappingError(
+            f"{len(missing)} pot(s) have no Firefly asset account with the pot id as its account number: "
+            + "; ".join(missing)
+        )
 
 
 def is_transient(exc: BaseException) -> bool:

@@ -2,13 +2,13 @@
 
 Prefect pipeline that imports bank transactions into Firefly III. It fetches
 booked transactions from [Enable Banking](https://enablebanking.com/) (PSD2
-account information), maps them with logic tuned to our own accounts, and writes
-them through the Firefly III API. It replaces the Firefly III data importer.
-Intent and done-when: [homelab#1981](https://github.com/sometimeskind/homelab/issues/1981).
-
-**Status:** complete, not live yet. The consent command, the flow, the Firefly client and
-the mapping exist. Go-live (save-only runs, backfill, clean start, writes on) is
-tracked in homelab#1981.
+account information) and from the [Monzo developer API](https://docs.monzo.com/)
+(a UK bank Enable Banking doesn't reach), maps them with logic tuned to our own
+accounts, and writes them through the Firefly III API. It replaces the Firefly III
+data importer. Intent and done-when:
+[homelab#1981](https://github.com/sometimeskind/homelab/issues/1981) (Enable Banking,
+live since 2026-10-15) and [#18](https://github.com/sometimeskind/transaction-pipeline/issues/18)
+(Monzo).
 
 ## Consent
 
@@ -27,11 +27,31 @@ not load; only the URL matters). The session goes to `$STATE_DIR/sessions/LABEL.
 so re-consent needs no secret and no PR. The consent validity asked for is the bank's
 published maximum.
 
+A Monzo login is authorised the same way, against Monzo's own OAuth (a confidential
+client of the holder's own, created at developers.monzo.com; the API is for personal
+use only):
+
+```
+python -m transaction_pipeline monzo-auth LABEL --redirect-url URL [--backfill]
+```
+
+It prints the Monzo login URL (Monzo emails a link); paste back the URL the browser
+lands on, then approve access in the Monzo app. The command waits for that approval,
+lists the open accounts and the pots, and writes the session, token included, to
+`$STATE_DIR/sessions/LABEL.json` with `"provider": "monzo"`. Under Strong Customer
+Authentication the holder re-approves every 90 days: the session's `valid_until` is
+that deadline, so the same gauge and alerts cover it, and the same command renews
+it. `--backfill` fetches every account's whole history right away into a save-only
+run: the five minutes after an approval are the only time Monzo serves more than
+the last 90 days. Use it on the first authorisation only, then store the run with
+`replay_run` (below).
+
 ## Configuration
 
 | Env var | Meaning |
 |---------|---------|
 | `ENABLE_BANKING_APP_ID`, `ENABLE_BANKING_PRIVATE_KEY_PATH` | Enable Banking app and its `.pem` |
+| `MONZO_CLIENT_ID`, `MONZO_CLIENT_SECRET` | the Monzo OAuth client (confidential); only needed with a Monzo session |
 | `FIREFLY_URL`, `FIREFLY_TOKEN` | Firefly III API |
 | `STATE_DIR` | state directory, default `/state` |
 | `FETCH_CRON` | schedule for `serve`; unset registers the deployment without one |
@@ -49,7 +69,9 @@ Metrics, both in Pushgateway group `transaction-pipeline`:
 `STATE_DIR` (default `/state`, a PVC in the cluster):
 
 - `sessions/<label>.json`: one Enable Banking session per bank login, with the bank
-  name and country used. The flow fetches every account of every session.
+  name and country used, or a Monzo session (`"provider": "monzo"`) with its OAuth
+  token, accounts and pots; the refresh token rotates, so the flow rewrites the file
+  after each refresh. The flow fetches every account of every session.
 - `raw/<flow-run-id>/<account-uid>/page-<n>.json`: every transaction page as the
   bank returned it, written before anything is mapped. The store step reads them back,
   so it retries (on Firefly errors only) without spending the bank budget.
@@ -95,6 +117,10 @@ Write fixtures from the Enable Banking API schema, not from a captured response.
 - **Consent lasts up to 180 days** (90 at some banks). The session's
   `valid_until` drives an advance warning, not just a failure after expiry.
 - **Transaction responses paginate** via `continuation_key`.
+- **Monzo has no request budget but a 90-day approval** (SCA), and serves the full
+  history only in the five minutes after an approval; afterwards the last 90 days.
+  Its API filters on `created` and a card payment settles days later, so its fetch
+  window starts 30 days before the run's, and only settled transactions are mapped.
 
 Prefect is the scheduler, never the source of truth
 ([homelab#1981 comment](https://github.com/sometimeskind/homelab/issues/1981), from the
@@ -126,8 +152,13 @@ account. Own accounts are found in four ways, in this order:
   re-consent and across logins. To set one up, create a Firefly asset account
   for it and put the account's `identification_hash` (from the session file
   under `STATE_DIR/sessions/`) in its **account number**, leaving the IBAN
-  empty. A run fails while an imported account has no Firefly account with its
-  IBAN or hash.
+  empty. A Monzo account has no IBAN either: its Firefly account carries the sort
+  code followed by the account number, digits only (the session's `number`), and
+  a counterparty showing those digits on another own account's booking is a
+  transfer to it. A Monzo pot is a sub-account whose moves appear on the current
+  account naming the pot by id: give each pot a Firefly asset account with the pot
+  id as its account number. A run fails while an imported account has no Firefly
+  account with its IBAN or number, or a pot of a Monzo session has none.
 - **By pairing internal moves:** some banks book a move between two own accounts
   as a SEPA credit transfer (`ICDT/ESCT` out, `RCDT/ESCT` in) whose counterparty
   shows no IBAN or account number, and often no name, on both sides (N26 Spaces,
@@ -178,8 +209,9 @@ session, so a run maps the union, by key, of what both sessions fetched for it.
 Every booking's Firefly `external_id` is derived from its content:
 `tp1:` followed by a SHA-256 hex digest of
 
-- the account key: the account's IBAN, else its Enable Banking
-  `identification_hash` (never the session uid, which changes on re-consent),
+- the account key: the account's IBAN, else its number (Enable Banking's
+  `identification_hash`; a Monzo account's sort code and account number), never
+  the session uid, which changes on re-consent,
 - `booking_date`, the amount (unsigned), currency and direction
   (`credit_debit_indicator`, or the amount's sign when there is none),
 - an ordinal among the bookings with those same fields on that account and day:

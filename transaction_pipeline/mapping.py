@@ -17,8 +17,10 @@ Used by the flow:
     payload = map_transaction(raw_transaction, own, book, ids[i], pairing.partner.get(ids[i]))
 
 A counterparty is an own account, and the booking a transfer, when its IBAN is
-on a Firefly asset account, else when the booking pairs with an internal move on
-another imported account (below), or else when it matches a rule from the rules file.
+on a Firefly asset account, or its other account identification (a sort code and
+account number, a Monzo pot id) is a Firefly asset account's account number, else
+when the booking pairs with an internal move on another imported account (below),
+or else when it matches a rule from the rules file.
 Rules cover own accounts that bookings don't name by IBAN, such as sub-accounts
 inside a bank account or a payment service in the middle of a transfer. The
 file is TOML at `MAPPING_CONFIG` (default /config/mapping.toml), optional: no
@@ -133,7 +135,8 @@ class OwnAccount:
     name: str
     iban: str | None
     imported: bool
-    # Firefly's account_number: an identification_hash for an account without an IBAN.
+    # Firefly's account_number: for an account without an IBAN, an identification_hash,
+    # a sort code and account number, or a Monzo pot id.
     number: str | None = None
 
 
@@ -248,7 +251,7 @@ class AccountBook:
         if missing_numbers:
             raise MappingError(
                 f"{len(missing_numbers)} imported account(s) without an IBAN have no Firefly account with their "
-                "identification_hash as its account number"
+                "number (identification_hash, or sort code and account number) as its account number"
             )
         by_name = {a.name: a for a in own}
         resolved = []
@@ -510,6 +513,8 @@ def map_transaction(
     party_name = ((party or {}).get("name") or "").strip() or None
     party_iban, party_number = _account_identifiers(party_account)
     other_own = book.get(party_iban)
+    if other_own is None and party_iban is None:
+        other_own = book.get_by_number(party_number)
     one_sided = False
     if other_own == account:
         other_own = None
