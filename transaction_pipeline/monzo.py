@@ -229,14 +229,28 @@ def _error_from(response: httpx.Response) -> MonzoError:
 # Session file: the shape flow.py reads for every provider, plus the token and the pots.
 
 
+def _digits(value: object) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def has_number(account: dict) -> bool:
+    """Whether the account has a sort code and account number: a current account does, Flex and the legacy prepaid card don't."""
+    return bool(_digits(account.get("sort_code")) and _digits(account.get("account_number")))
+
+
+def unnumbered(accounts: list[dict]) -> list[dict]:
+    """The open accounts without a sort code and account number: listed by Monzo, not imported (no Firefly account can match them)."""
+    return [a for a in accounts if not a.get("closed") and not has_number(a)]
+
+
 def account_entry(account: dict) -> dict:
     """A session account: `uid` is the Monzo account id, `number` the sort code and account number, digits only.
 
     The Firefly asset account carries `number` as its account number (no IBAN), and
     so does a counterparty that is this account on another own account's booking.
     """
-    sort_code = "".join(ch for ch in (account.get("sort_code") or "") if ch.isdigit())
-    number = "".join(ch for ch in (account.get("account_number") or "") if ch.isdigit())
+    sort_code = _digits(account.get("sort_code"))
+    number = _digits(account.get("account_number"))
     if not (sort_code and number):
         raise MonzoError(200, None, f"account {account.get('id')} has no sort code and account number")
     return {
@@ -253,14 +267,18 @@ def pot_entry(pot: dict) -> dict:
 
 
 def session(token: Token, accounts: list[dict], pots: list[dict], authorised_at: datetime) -> dict:
-    """The session file for a Monzo login, with `access.valid_until` the re-approval deadline."""
+    """The session file for a Monzo login, with `access.valid_until` the re-approval deadline.
+
+    Closed accounts and open ones without a sort code and account number (Flex, the
+    legacy prepaid card) are left out: nothing in Firefly could match them.
+    """
     valid_until = authorised_at + timedelta(days=REAUTH_DAYS) - REAUTH_MARGIN
     return {
         "provider": PROVIDER,
         "token": token.to_json(),
         "authorised_at": authorised_at.isoformat(),
         "access": {"valid_until": valid_until.isoformat()},
-        "accounts": [account_entry(a) for a in accounts if not a.get("closed")],
+        "accounts": [account_entry(a) for a in accounts if not a.get("closed") and has_number(a)],
         "pots": [pot_entry(p) for p in pots],
     }
 

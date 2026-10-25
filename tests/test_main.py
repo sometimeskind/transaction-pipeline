@@ -158,6 +158,7 @@ MONZO_ACCOUNTS = [
     {"id": MONZO_ACC, "closed": False, "type": "uk_retail", "sort_code": "040004", "account_number": "12345678",
      "currency": "GBP", "created": "2020-01-01T00:00:00Z"},
     {"id": "acc_0000synthetic00000000002", "closed": True, "type": "uk_prepaid"},
+    {"id": "acc_0000synthetic00000000003", "closed": False, "type": "uk_monzo_flex", "currency": "GBP"},
 ]
 
 
@@ -236,10 +237,20 @@ def test_monzo_auth_waits_for_the_approval_then_writes_the_session(state):
     assert saved["access"]["valid_until"] == (NOW + timedelta(days=90) - monzo.REAUTH_MARGIN).isoformat()
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert "auth.monzo.com" in out.getvalue() and "1 account(s), 1 pot(s)" in out.getvalue()
+    # The open Flex account has no sort code and account number: said so, left out of the session.
+    assert "Skipping account acc_0000synthetic00000000003 (uk_monzo_flex)" in out.getvalue()
     # A token refreshed later lands in the file too.
     client.on_token(monzo.Token("access-2", "refresh-2", NOW))
     assert json.loads(path.read_text())["token"]["refresh_token"] == "refresh-2"
     assert json.loads(path.read_text())["accounts"] == saved["accounts"]
+
+
+def test_monzo_auth_fails_when_no_account_has_a_sort_code_and_number(state):
+    client = FakeMonzo([MONZO_ACCOUNTS[1], MONZO_ACCOUNTS[2]])
+    out = io.StringIO()
+    with pytest.raises(cli.ConsentError, match="no open account with a sort code"):
+        cli.run_monzo_auth(client, monzo_args(), MonzoRedirect(out), out, now=lambda: NOW, wait=lambda s: None)
+    assert not (state / "sessions" / "monzo.json").exists()
 
 
 def test_monzo_auth_gives_up_when_the_approval_does_not_come(state):

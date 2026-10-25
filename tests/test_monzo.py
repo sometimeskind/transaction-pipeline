@@ -209,11 +209,12 @@ def test_a_page_that_repeats_the_last_id_is_an_error(client):
 OPEN_ACCOUNT = {"id": ACCOUNT, "closed": False, "type": "uk_retail", "sort_code": "04-00-04", "account_number": "12345678",
                 "currency": "GBP", "created": "2020-01-01T00:00:00Z", "description": "user_synthetic"}
 CLOSED_ACCOUNT = {"id": "acc_0000synthetic00000000002", "closed": True, "type": "uk_prepaid"}
+FLEX_ACCOUNT = {"id": "acc_0000synthetic00000000003", "closed": False, "type": "uk_monzo_flex", "currency": "GBP"}
 
 
 def test_session_has_the_provider_token_open_accounts_pots_and_the_reapproval_deadline():
     t = Token("access-1", "refresh-1", NOW + timedelta(hours=6))
-    session = monzo.session(t, [OPEN_ACCOUNT, CLOSED_ACCOUNT], [{"id": POT, "name": "Synthetic pot"}], NOW)
+    session = monzo.session(t, [OPEN_ACCOUNT, CLOSED_ACCOUNT, FLEX_ACCOUNT], [{"id": POT, "name": "Synthetic pot"}], NOW)
     assert session == {
         "provider": "monzo",
         "token": t.to_json(),
@@ -228,6 +229,11 @@ def test_session_has_the_provider_token_open_accounts_pots_and_the_reapproval_de
 def test_an_account_without_sort_code_and_number_is_refused():
     with pytest.raises(MonzoError, match="sort code"):
         monzo.account_entry({"id": ACCOUNT, "sort_code": None, "account_number": ""})
+
+
+def test_open_accounts_without_a_number_are_unnumbered_and_closed_ones_are_not():
+    assert monzo.has_number(OPEN_ACCOUNT) and not monzo.has_number(FLEX_ACCOUNT)
+    assert monzo.unnumbered([OPEN_ACCOUNT, CLOSED_ACCOUNT, FLEX_ACCOUNT]) == [FLEX_ACCOUNT]
 
 
 # Adapter

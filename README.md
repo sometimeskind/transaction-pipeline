@@ -38,7 +38,10 @@ python -m transaction_pipeline monzo-auth LABEL --redirect-url URL [--backfill]
 It prints the Monzo login URL (Monzo emails a link); paste back the URL the browser
 lands on, then approve access in the Monzo app. The command waits for that approval,
 lists the open accounts and the pots, and writes the session, token included, to
-`$STATE_DIR/sessions/LABEL.json` with `"provider": "monzo"`. Under Strong Customer
+`$STATE_DIR/sessions/LABEL.json` with `"provider": "monzo"`. Only accounts with a
+sort code and account number are imported (the Firefly asset account carries those
+as its account number); an open account without them, such as Monzo Flex or the
+legacy prepaid card, is named and skipped. Under Strong Customer
 Authentication the holder re-approves every 90 days: the session's `valid_until` is
 that deadline, so the same gauge and alerts cover it, and the same command renews
 it. `--backfill` fetches every account's whole history right away into a save-only
