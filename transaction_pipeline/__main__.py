@@ -163,14 +163,23 @@ def run_monzo_auth(
     accounts = wait_for_approval(client, now, wait)
     authorised_at = now()
     open_accounts = [a for a in accounts if not a.get("closed")]
-    pots = [pot for account in open_accounts for pot in client.pots(account["id"])]
+    for account in monzo.unnumbered(open_accounts):
+        print(
+            f"Skipping account {account['id']} ({account.get('type')}): it has no sort code and account number, "
+            "so no Firefly account can match it; not imported",
+            file=stdout,
+        )
+    numbered = [a for a in open_accounts if monzo.has_number(a)]
+    if not numbered:
+        raise ConsentError("no open account with a sort code and account number; nothing to import")
+    pots = [pot for account in numbered for pot in client.pots(account["id"])]
     session = monzo.session(client.token, open_accounts, pots, authorised_at)  # type: ignore[arg-type]
     path = flow.session_path(args.label)
     flow.write_json(path, session)
     # From here on, a refreshed token goes to the file too.
     client.on_token = lambda token: flow.write_json(path, {**session, "token": token.to_json()})
     print(
-        f"Saved the session to {path}: {len(open_accounts)} account(s), {len(pots)} pot(s), "
+        f"Saved the session to {path}: {len(numbered)} account(s), {len(pots)} pot(s), "
         f"approval valid until {session['access']['valid_until'][:10]}",
         file=stdout,
     )
