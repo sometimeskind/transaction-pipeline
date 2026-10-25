@@ -33,6 +33,10 @@ AUTH_URL = "https://auth.monzo.com/"
 PROVIDER = "monzo"
 TIMEOUT_SECONDS = 60.0
 PAGE_LIMIT = 100
+# Since 2024-01 Monzo answers a listing of more than about a year with
+# 400 bad_request.invalid_time_range, so a longer range is fetched in slices of
+# this many days (the backfill asks for the account's whole history).
+SLICE_DAYS = 180
 # The holder re-approves access in the app every 90 days (SCA). The session's
 # valid_until is set a little earlier, so the alert fires before Monzo cuts access.
 REAUTH_DAYS = 90
@@ -186,29 +190,37 @@ class MonzoClient:
         """Yield each raw page of transactions created in [since, before), oldest first.
 
         Pages are yielded unmodified so the caller can persist each one before the
-        next request. The API pages by `since=<last id>`; a page shorter than
-        PAGE_LIMIT is the last.
+        next request. A range longer than SLICE_DAYS is listed slice by slice (Monzo
+        refuses about a year or more in one listing). Within a slice the API pages
+        by `since=<last id>`; a page shorter than PAGE_LIMIT is the slice's last.
+        The first request's page is yielded even when empty, later empty ones are not.
         """
-        params: dict = {
-            "account_id": account_id,
-            "since": rfc3339(since),
-            "before": rfc3339(before),
-            "limit": PAGE_LIMIT,
-            "expand[]": "merchant",
-        }
         first = True
+        start = since
         while True:
-            page = self._request("GET", "/transactions", params=params)
-            transactions = page.get("transactions") or []
-            if transactions or first:
-                yield page
-            first = False
-            if len(transactions) < PAGE_LIMIT:
+            end = min(start + timedelta(days=SLICE_DAYS), before)
+            params: dict = {
+                "account_id": account_id,
+                "since": rfc3339(start),
+                "before": rfc3339(end),
+                "limit": PAGE_LIMIT,
+                "expand[]": "merchant",
+            }
+            while True:
+                page = self._request("GET", "/transactions", params=params)
+                transactions = page.get("transactions") or []
+                if transactions or first:
+                    yield page
+                first = False
+                if len(transactions) < PAGE_LIMIT:
+                    break
+                last = transactions[-1]["id"]
+                if last == params["since"]:
+                    raise MonzoError(200, None, f"pagination repeated transaction {last}")
+                params = {**params, "since": last}
+            if end >= before:
                 return
-            last = transactions[-1]["id"]
-            if last == params["since"]:
-                raise MonzoError(200, None, f"pagination repeated transaction {last}")
-            params = {**params, "since": last}
+            start = end
 
 
 def _error_from(response: httpx.Response) -> MonzoError:

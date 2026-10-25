@@ -46,8 +46,9 @@ Authentication the holder re-approves every 90 days: the session's `valid_until`
 that deadline, so the same gauge and alerts cover it, and the same command renews
 it. `--backfill` fetches every account's whole history right away into a save-only
 run: the five minutes after an approval are the only time Monzo serves more than
-the last 90 days. Use it on the first authorisation only, then store the run with
-`replay_run` (below).
+the last 90 days. The history is listed in slices of `SLICE_DAYS` (Monzo refuses
+about a year or more in one listing). Use it on the first authorisation only, then
+store the run with `replay_run` (below).
 
 ## Configuration
 

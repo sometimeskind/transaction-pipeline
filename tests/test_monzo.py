@@ -181,6 +181,27 @@ def test_transaction_pages_follow_the_last_id_and_stop_at_a_short_page(client):
 
 
 @respx.mock
+def test_a_long_range_is_listed_in_slices_and_only_the_first_empty_page_is_a_page(client):
+    # 400 days: slices of 180, 180 and 40 days. Monzo refuses about a year in one listing.
+    route = respx.get(f"{API}/transactions").mock(side_effect=[
+        httpx.Response(200, json={"transactions": ids(100)}),
+        httpx.Response(200, json={"transactions": ids(3, 101)}),
+        httpx.Response(200, json={"transactions": []}),
+        httpx.Response(200, json={"transactions": ids(2, 104)}),
+    ])
+    since = datetime(2025, 1, 1, tzinfo=UTC)
+    pages = list(client.transaction_pages(ACCOUNT, since, since + timedelta(days=400)))
+    assert [len(p["transactions"]) for p in pages] == [100, 3, 2]
+    ranges = [(c.request.url.params["since"], c.request.url.params["before"]) for c in route.calls]
+    assert ranges == [
+        ("2025-01-01T00:00:00Z", "2025-06-30T00:00:00Z"),
+        (ids(100)[-1]["id"], "2025-06-30T00:00:00Z"),
+        ("2025-06-30T00:00:00Z", "2025-12-27T00:00:00Z"),
+        ("2025-12-27T00:00:00Z", "2026-02-05T00:00:00Z"),
+    ]
+
+
+@respx.mock
 def test_a_full_last_page_is_followed_by_no_empty_page(client):
     respx.get(f"{API}/transactions").mock(side_effect=[
         httpx.Response(200, json={"transactions": ids(100)}),
