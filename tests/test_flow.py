@@ -212,6 +212,9 @@ class FakeFirefly:
     def accounts(self, account_type="asset"):
         return [{"id": str(i), "attributes": {"iban": iban}} for i, iban in enumerate((IBAN_A, IBAN_B, IBAN_C))]
 
+    def find_by_external_id(self, external_id):
+        return {"id": "old", "attributes": {"transactions": [{"external_id": external_id}]}} if external_id in self.existing else None
+
     def store_if_absent(self, payload):
         ref = payload["transactions"][0]["external_id"]
         if ref in self.existing:
@@ -1004,6 +1007,10 @@ class PassThroughFirefly(FakeFirefly):
                                        "currency_code": "EUR"}},
         ]
 
+    def find_by_external_id(self, external_id):
+        found = [s for s in self.splits if s.get("external_id") == external_id]
+        return {"id": "old", "attributes": {"transactions": found}} if external_id in self.existing and found else None
+
     def store_if_absent(self, payload):
         split = payload["transactions"][0]
         if split["external_id"] in self.existing:
@@ -1038,9 +1045,9 @@ def leg(journal_id: str, day: str = "2026-01-03", amount: str = "115.20000000000
     return split
 
 
-def top_up(id: str = "tx_w1", day: str = "2026-01-02", amount: int = -10000) -> dict:
+def top_up(id: str = "tx_w1", day: str = "2026-01-02", amount: int = -10000, settled: str | None = None) -> dict:
     return mtx(id, amount=amount, merchant=None, description="TOP UP", scheme="payport_faster_payments",
-               created=f"{day}T10:00:00Z", settled=f"{day}T10:00:00Z",
+               created=f"{day}T10:00:00Z", settled=f"{settled or day}T10:00:00Z",
                counterparty={"name": "Synthetic pass-through", "sort_code": "23-14-70", "account_number": "12345678"})
 
 
@@ -1101,6 +1108,15 @@ def test_no_leg_within_the_window_is_unpaired_and_fails_after_the_rest(tmp_path)
     assert [p["transactions"][0]["type"] for p in firefly.stored] == ["withdrawal"]
 
 
+def test_a_leg_dated_before_the_booking_is_found_as_the_settlement_day_follows_the_payment(tmp_path):
+    pages = fetch_both(tmp_path, empty(UID_A), [{"transactions": [top_up(day="2026-01-02", settled="2026-01-03")]}])
+    firefly = PassThroughFirefly(legs=[leg("401", day="2026-01-02"), leg("402", day="2025-12-26")])  # 402: 8 days before
+    assert flow.store_from_disk(firefly, pass_through_sessions(), pages) == flow.StoreCounts(created=1)
+    assert firefly.links == [("1001", "401")]
+    assert flow.store_from_disk(PassThroughFirefly(legs=[leg("402", day="2025-12-27")]), pass_through_sessions(),
+                                pages) == flow.StoreCounts(created=1)
+
+
 def test_top_ups_take_legs_in_date_order_and_skip_linked_ones(tmp_path):
     pages = fetch_both(tmp_path, empty(UID_A), [{"transactions": [top_up("tx_w2", day="2026-01-04", amount=-20000), top_up("tx_w1", day="2026-01-02")]}])
     firefly = PassThroughFirefly(legs=[leg("401"), leg("402"), leg("403", day="2026-01-05", amount="230.400000000000")], linked={"401"})
@@ -1120,6 +1136,28 @@ def test_an_existing_pass_through_transfer_is_linked_when_it_has_no_link_yet(tmp
     linked = PassThroughFirefly(legs=[leg("401"), stored], existing={key}, linked={"900"})
     assert flow.store_from_disk(linked, pass_through_sessions(), pages) == flow.StoreCounts(existing=1)
     assert linked.links == []
+
+
+def test_a_pass_through_transfer_booked_by_hand_under_its_key_needs_no_leg(tmp_path):
+    """A top-up the service sent straight back has no EUR leg; booked by hand with the key, it counts as existing."""
+    pages = fetch_both(tmp_path, empty(UID_A), [{"transactions": [top_up(day="2025-12-20"), mtx("tx_g")]}])
+    [key] = mapping.external_ids(("number", MONZO_NUMBER), monzo.adapt([top_up(day="2025-12-20")], {}))
+    by_hand = leg("900", day="2025-12-20", amount="100.00", source_id="7", destination_id="9", currency_code="GBP",
+                  foreign_amount="115.2", foreign_currency_code="EUR", external_id=key)
+    firefly = PassThroughFirefly(legs=[by_hand], existing={key})
+    assert flow.store_from_disk(firefly, pass_through_sessions(), pages) == flow.StoreCounts(created=1, existing=1)
+    assert [p["transactions"][0]["type"] for p in firefly.stored] == ["withdrawal"]
+    assert firefly.links == []
+    refund = top_up(day="2025-12-22", amount=10000)
+    pages = fetch_both(tmp_path, empty(UID_A), [{"transactions": [refund, mtx("tx_g")]}])
+    [key] = mapping.external_ids(("number", MONZO_NUMBER), monzo.adapt([refund], {}))
+    booked_in_eur = leg("901", day="2025-12-22", amount="115.2", source_id="9", destination_id="7", currency_code="EUR",
+                        foreign_amount="100.00", foreign_currency_code="GBP", external_id=key)
+    firefly = PassThroughFirefly(legs=[booked_in_eur], existing={key})
+    assert flow.store_from_disk(firefly, pass_through_sessions(), pages) == flow.StoreCounts(created=1, existing=1)
+    wrong = PassThroughFirefly(legs=[{**booked_in_eur, "foreign_amount": "99.00"}], existing={key})
+    with pytest.raises(ExternalIdConflictError, match="with 99.00 GBP, the bank says 100.00"):
+        flow.store_from_disk(wrong, pass_through_sessions(), pages)
 
 
 def test_a_dry_run_maps_pass_through_transfers_but_stores_and_links_nothing(tmp_path):

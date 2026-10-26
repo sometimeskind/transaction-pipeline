@@ -215,14 +215,20 @@ payment service such as Wise between a GBP and a EUR account) needs Firefly's
 `foreign_amount` in that account's currency, and the bank data has only this side's
 amount. The flow stores such bookings last and takes the amount from the account's
 other leg in Firefly: the transfer out of it (for a debit into it; into it for a
-credit) to another own account, dated from the booking day to 7 days later, the
-earliest one that has no transaction link yet. Once stored, the two are linked
-(link type "Related"), so the pairing shows in Firefly and a rerun is idempotent.
-No leg yet while that window is still open leaves the booking for a later run; a
+credit) to another own account, dated within 7 days either side of the booking
+day, the earliest one that has no transaction link yet. The leg often precedes
+the booking: Monzo books the settlement day, a faster payment settles the day
+after it was made while the service pays out at once, and a credit's funding leg
+comes before the payout. Once stored, the two are linked (link type "Related"),
+so the pairing shows in Firefly and a rerun is idempotent. No leg yet while the 7
+days after the booking are still open leaves the booking for a later run; a
 closed window counts it as unpaired, and the run fails after storing everything
-else. The way out is to create the missing leg in Firefly by hand. The
-pass-through account's balance then stays near zero, and a drift flags a missing
-leg.
+else. The way out is to create the missing leg in Firefly by hand. When no leg
+can exist (a top-up the service sent straight back, so no amount in its currency
+ever did), book the transfer itself by hand with its key, from the log line, as
+the external id: a booking Firefly holds under its key, with the bank's amount,
+counts as existing and needs no leg. The pass-through account's balance then
+stays near zero, and a drift flags a missing leg.
 
 ## Idempotency
 
