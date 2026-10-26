@@ -32,13 +32,19 @@ never go in this repo. Rules are checked in order:
     name = "^holiday pot$"            # regex on the counterparty name
     remittance = "pot transfer"       # regex on the remittance text
     iban = "XX00..."                  # optional, see below
+    number = "23147012345678"         # optional: a sort code and account number, digits only
 
-A rule needs `account` and at least one of `name` and `remittance`; all of the
-patterns it gives must match (searched, case-insensitive). The payer chooses the
-name and remittance text, so a rule without `iban` only applies when the
-counterparty shows no IBAN or the booking account's own: a stranger's payment
+A rule needs `account` and at least one of `name`, `remittance`, `iban` and
+`number`; all of the patterns it gives must match (searched, case-insensitive). The payer
+chooses the name and remittance text, so a rule without `iban` only applies when
+the counterparty shows no IBAN or the booking account's own: a stranger's payment
 carries the stranger's IBAN and can't pose as a sub-account move. Give `iban`
-for an intermediary whose IBAN does appear (the rule then needs that exact one).
+for an intermediary whose IBAN does appear (the rule then needs that exact one);
+`iban` alone maps every booking with that IBAN, for an own account that pays out
+from a second IBAN, since a Firefly account holds only one. `number` is the same
+for a counterparty shown by sort code and account number (Monzo), spaces and
+dashes ignored: a payment service's older pay-in details, when the current ones
+are the Firefly account's number.
 
 Two optional rule keys cover moves the bank shows on one side only:
 
@@ -177,6 +183,8 @@ class CounterpartyRule:
     name: re.Pattern | None = None
     remittance: re.Pattern | None = None
     iban: str | None = None
+    # The counterparty's non-IBAN account number (a UK sort code and account number as one run of digits).
+    number: str | None = None
     # Firefly name of the only account whose bookings the rule applies to.
     booked_on: str | None = None
     # The other side never shows in the bank data, so a matching credit is the transfer.
@@ -204,10 +212,10 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
     config = tomllib.loads(path.read_text())
     rules = []
     for i, entry in enumerate(config.get("own_counterparty", [])):
-        unknown = set(entry) - {"account", "name", "remittance", "iban", "booked_on", "other_side_missing"}
-        if unknown or "account" not in entry or not ({"name", "remittance"} & set(entry)):
+        unknown = set(entry) - {"account", "name", "remittance", "iban", "number", "booked_on", "other_side_missing"}
+        if unknown or "account" not in entry or not ({"name", "remittance", "iban", "number"} & set(entry)):
             raise MappingError(
-                f"{path}: own_counterparty[{i}] needs account plus name and/or remittance"
+                f"{path}: own_counterparty[{i}] needs account plus name, remittance, iban and/or number"
                 + (f", and has unknown keys {sorted(unknown)}" if unknown else "")
             )
         rules.append(
@@ -216,6 +224,7 @@ def load_rules(path: Path | None = None) -> list[CounterpartyRule]:
                 name=re.compile(entry["name"], re.IGNORECASE) if "name" in entry else None,
                 remittance=re.compile(entry["remittance"], re.IGNORECASE) if "remittance" in entry else None,
                 iban=normalise_iban(entry["iban"]) if "iban" in entry else None,
+                number=normalise_number(entry["number"]) if "number" in entry else None,
                 booked_on=entry.get("booked_on"),
                 other_side_missing=entry.get("other_side_missing") is True,
             )
@@ -295,7 +304,8 @@ class AccountBook:
         return self._by_number.get((number or "").strip())
 
     def own_counterparty(
-        self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str
+        self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str,
+        party_number: str | None = None,
     ) -> OwnAccount | None:
         """The own account on the other side of a booking on `account`, if it is one.
 
@@ -305,26 +315,35 @@ class AccountBook:
         by_iban = self.get(party_iban)
         if by_iban is not None and by_iban != account:
             return by_iban
-        found = self.rule_for(account, party_name, party_iban, remittance)
+        found = self.rule_for(account, party_name, party_iban, remittance, party_number)
         return found[1] if found else None
 
     def rule_for(
-        self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str
+        self, account: OwnAccount, party_name: str | None, party_iban: str | None, remittance: str,
+        party_number: str | None = None,
     ) -> tuple[CounterpartyRule, OwnAccount | None] | None:
         """The first rule matching a booking on `account`, with the own account it names.
 
         A `[[counterparty]]` rule names no own account and only matches a booking without a counterparty name.
         """
         party_iban = normalise_iban(party_iban or "") or None
+        party_number = normalise_number(party_number or "") or None
         for rule, own in self._rules:
             expected = {rule.iban} if rule.iban else {None, account.iban}
             if rule.booked_on is not None and rule.booked_on != account.name:
                 continue
             if rule.counterparty is not None and party_name is not None:
                 continue
+            if rule.number is not None and party_number != rule.number:
+                continue
             if own != account and party_iban in expected and rule.matches(party_name, remittance):
                 return rule, own
         return None
+
+
+def normalise_number(number: str) -> str:
+    """An account number as the adapters give it: no spaces or dashes (a UK sort code and account number run together)."""
+    return re.sub(r"[\s-]", "", number)
 
 
 def normalise_iban(iban: str) -> str:
@@ -555,7 +574,7 @@ def map_transaction(
     if other_own is None:
         other_own = paired
     if other_own is None:
-        found = book.rule_for(account, party_name, party_iban, _remittance(raw))
+        found = book.rule_for(account, party_name, party_iban, _remittance(raw), party_number)
         if found is not None:
             rule, other_own = found
             one_sided = rule.other_side_missing

@@ -420,6 +420,38 @@ def test_load_rules_rejects_incomplete_or_unknown_entries(tmp_path, body):
         load_rules(path)
 
 
+def test_load_rules_accepts_an_iban_only_rule(tmp_path):
+    path = tmp_path / "rules.toml"
+    path.write_text('[[own_counterparty]]\naccount = "Synthetic pot"\niban = "XX00 SYNTHETIC 0000000077"\n')
+
+    [rule] = load_rules(path)
+    assert (rule.account, rule.name, rule.remittance, rule.iban) == ("Synthetic pot", None, None, "XX00SYNTHETIC0000000077")
+    assert rule.matches("Anyone", "")
+
+
+def test_rule_with_number_needs_that_number_and_comes_before_a_name_rule():
+    by_number = CounterpartyRule("Synthetic pot", number="23147012345678")
+    other_pot = OwnAccount("8", "Synthetic other pot", None, imported=False)
+    by_name = CounterpartyRule("Synthetic other pot", name=re.compile("^me$", re.IGNORECASE))
+    book = AccountBook([CHECKING, POT, other_pot], [(by_number, POT), (by_name, other_pot)])
+    uk = {"other": {"identification": "23147012345678", "scheme_name": "UK_SORT_CODE_ACCOUNT_NUMBER"}}
+    other_uk = {"other": {"identification": "23147087654321", "scheme_name": "UK_SORT_CODE_ACCOUNT_NUMBER"}}
+
+    hit = _tx(creditor={"name": "Me"}, creditor_account=uk)
+    miss = _tx(creditor={"name": "Me"}, creditor_account=other_uk)
+
+    assert _split(map_transaction(hit, CHECKING, book, KEY))["destination_id"] == POT.firefly_id
+    assert _split(map_transaction(miss, CHECKING, book, KEY))["destination_id"] == other_pot.firefly_id
+
+
+def test_load_rules_accepts_a_number_only_rule_and_strips_its_dashes(tmp_path):
+    path = tmp_path / "rules.toml"
+    path.write_text('[[own_counterparty]]\naccount = "Synthetic pot"\nnumber = "23-14-70 12345678"\n')
+
+    [rule] = load_rules(path)
+    assert (rule.account, rule.number) == ("Synthetic pot", "23147012345678")
+
+
 def test_rule_ignores_a_stranger_who_writes_matching_text():
     raw = _tx(credit_debit_indicator="CRDT", debtor={"name": "Synthetic Pot"}, debtor_account={"iban": GROCER_IBAN})
 

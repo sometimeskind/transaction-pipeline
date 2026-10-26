@@ -85,7 +85,7 @@ STORE_RETRIES = 2
 STORE_RETRY_DELAY_SECONDS = 30
 # Raw pages left behind by a failed run, kept for debugging, then deleted.
 RAW_KEEP_FAILED_DAYS = 7
-# How many days after a pass-through transfer its other leg may be dated (store_pass_through).
+# How many days either side of a pass-through transfer its other leg may be dated (store_pass_through).
 PASS_THROUGH_DAYS = 7
 
 CONSENT_HINT = "run `python -m transaction_pipeline consent {label} ...` in the transaction-pipeline pod"
@@ -541,15 +541,21 @@ def store_pass_through(
     but not imported, and keeps another currency than the booking. Firefly needs
     the transfer's amount in that currency too, and only the account's other leg
     has it: the transfer out of it (for a debit into it; into it for a credit
-    from it) to another own account, already in Firefly, dated from the booking
-    day to PASS_THROUGH_DAYS later. Oldest booking first, each takes the earliest
+    from it) to another own account, already in Firefly, dated within
+    PASS_THROUGH_DAYS either side of the booking day. The leg often precedes the
+    booking: Monzo books the settlement day, and a faster payment settles the day
+    after it was made while the service pays out at once, and a credit's funding
+    leg comes before the payout. Oldest booking first, each takes the earliest
     such leg that has no transaction link yet, and the two are linked once
     stored, which makes the claim visible in Firefly and a rerun idempotent.
 
     No leg yet while the window is still open (relative to the latest booking
     day in the run) leaves the booking for a later run; a closed window counts
     it as unpaired, and the store fails after everything else, like an unpaired
-    move. The way out is to create the missing leg by hand in Firefly.
+    move. The way out is to create the missing leg by hand in Firefly, or, when
+    no other leg exists (a top-up the service sent straight back), to book the
+    transfer itself by hand with its key as the external id: a booking Firefly
+    holds under its key counts as existing and needs no leg.
     """
     created = existing = not_written = deferred = unpaired = 0
     claimed: set[str] = set()
@@ -557,6 +563,11 @@ def store_pass_through(
         b, other = item.booking, item.account
         day = mapping.booking_day(b.raw)
         leg = find_leg(client, other, item.debit, day, claimed)
+        if leg is None and booked_by_hand(client, b):
+            existing += 1
+            log.info("%s: transfer with %s booked %s is in Firefly under its key already; no leg needed",
+                     b.external_id, other.name, day)
+            continue
         if leg is None:
             if last_day is not None and day + timedelta(days=PASS_THROUGH_DAYS) >= last_day:
                 deferred += 1
@@ -588,12 +599,35 @@ def store_pass_through(
     return counts
 
 
+def booked_by_hand(client: firefly.FireflyClient, booking: mapping.Booking) -> bool:
+    """Whether Firefly holds this booking under its key already, with the bank's amount on one side (else a conflict)."""
+    group = client.find_by_external_id(booking.external_id)
+    if group is None:
+        return False
+    found = next(s for s in group["attributes"]["transactions"] if s.get("external_id") == booking.external_id)
+    money = booking.raw.get("transaction_amount") or {}
+    currency = (money.get("currency") or "").upper()
+    if (found.get("currency_code") or "").upper() == currency:
+        booked = found.get("amount")
+    elif (found.get("foreign_currency_code") or "").upper() == currency:
+        booked = found.get("foreign_amount")
+    else:
+        booked = None
+    if booked is None or Decimal(booked) != Decimal(money["amount"]):
+        raise firefly.ExternalIdConflictError(
+            f"external_id {booking.external_id!r} exists in group {group['id']} with {booked} {currency}, "
+            f"the bank says {money['amount']}"
+        )
+    return True
+
+
 def find_leg(
     client: firefly.FireflyClient, other: mapping.OwnAccount, debit: bool, day: date, claimed: set[str]
 ) -> dict | None:
-    """The earliest unlinked transfer out of `other` (debit) or into it (credit) within PASS_THROUGH_DAYS of `day`."""
+    """The earliest unlinked transfer out of `other` (debit) or into it (credit) within PASS_THROUGH_DAYS either side of `day`."""
     side = "source_id" if debit else "destination_id"
-    splits = client.account_transactions(other.firefly_id, day, day + timedelta(days=PASS_THROUGH_DAYS), "transfer")
+    window = timedelta(days=PASS_THROUGH_DAYS)
+    splits = client.account_transactions(other.firefly_id, day - window, day + window, "transfer")
     candidates = sorted(
         (s for s in splits
          if str(s.get(side)) == other.firefly_id and s.get("transaction_journal_id") not in claimed
