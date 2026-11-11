@@ -1,4 +1,4 @@
-FROM python:3.14-slim AS prod
+FROM python:3.15-slim AS prod
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
